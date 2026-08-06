@@ -6,6 +6,12 @@
  * keypair at activation. The private key never leaves the store. Felix stores
  * only the public key.
  *
+ * Signing approach: the signature is computed over a canonical JSON string
+ * with the "signature" field REMOVED entirely (not zeroed). This avoids
+ * cross-language JSON canonicalization issues (null bytes, escaping order).
+ * Both PHP and Node.js produce identical JSON when using json_encode /
+ * JSON.stringify on an object without the signature field.
+ *
  * @package FelixConnector
  */
 
@@ -14,15 +20,6 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 class Felix_Crypto {
-
-	/**
-	 * Generate an Ed25519 keypair.
-	 *
-	 * Returns array with 'publicKey' (hex) and 'secretKey' (hex, stored encrypted).
-	 *
-	 * @return array{publicKey: string, secretKey: string}
-	 */
-// generate_keypair() removed — use generate_identity() instead.
 
 	/**
 	 * Generate an Ed25519 identity keypair.
@@ -36,14 +33,10 @@ class Felix_Crypto {
 
 		$public_hex = sodium_bin2hex( $public_key );
 		$secret_hex = sodium_bin2hex( $secret_key );
-
-		// For sending to Felix: base64-encoded raw public key bytes.
 		$public_b64 = base64_encode( $public_key );
 
-		// Encrypt secret for at-rest storage.
 		$encrypted_secret = self::encrypt_local( $secret_hex );
 
-		// Clean sensitive data from memory.
 		sodium_memzero( $keypair );
 		sodium_memzero( $public_key );
 		sodium_memzero( $secret_key );
@@ -59,8 +52,8 @@ class Felix_Crypto {
 	/**
 	 * Decrypt the secret key from storage.
 	 *
-	 * @param string $encrypted The encrypted secret.
-	 * @return string The raw secret key bytes (32 bytes for Ed25519).
+	 * @param string $encrypted
+	 * @return string|false Raw secret key bytes (64 bytes for Ed25519 secret).
 	 */
 	public static function get_secret_key( $encrypted ) {
 		$decrypted_hex = self::decrypt_local( $encrypted );
@@ -75,9 +68,9 @@ class Felix_Crypto {
 	/**
 	 * Sign a message with the plugin's private key.
 	 *
-	 * @param string $message      Raw bytes to sign.
-	 * @param string $secret_key   Raw secret key bytes (from get_secret_key).
-	 * @return string              base64-encoded signature, prefixed with 'ed25519:'.
+	 * @param string $message    Raw bytes to sign.
+	 * @param string $secret_key Raw secret key bytes.
+	 * @return string            'ed25519:' + base64 signature.
 	 */
 	public static function sign( $message, $secret_key ) {
 		$signature = sodium_crypto_sign_detached( $message, $secret_key );
@@ -90,12 +83,11 @@ class Felix_Crypto {
 	 * Verify an Ed25519 signature.
 	 *
 	 * @param string $message       Raw bytes that were signed.
-	 * @param string $signature_b64 base64-encoded signature (with or without 'ed25519:' prefix).
-	 * @param string $public_key_b64 base64-encoded public key.
+	 * @param string $signature_b64 Signature (with or without 'ed25519:' prefix).
+	 * @param string $public_key_b64 Public key (with or without 'ed25519:' prefix).
 	 * @return bool
 	 */
 	public static function verify( $message, $signature_b64, $public_key_b64 ) {
-		// Strip prefix if present.
 		$sig_b64 = self::strip_prefix( $signature_b64, 'ed25519:' );
 		$pub_b64 = self::strip_prefix( $public_key_b64, 'ed25519:' );
 
@@ -105,11 +97,9 @@ class Felix_Crypto {
 		if ( $sig_raw === false || $pub_raw === false ) {
 			return false;
 		}
-
 		if ( strlen( $sig_raw ) !== SODIUM_CRYPTO_SIGN_BYTES ) {
 			return false;
 		}
-
 		if ( strlen( $pub_raw ) !== SODIUM_CRYPTO_SIGN_PUBLICKEYBYTES ) {
 			return false;
 		}
@@ -125,64 +115,56 @@ class Felix_Crypto {
 	/**
 	 * Verify a command envelope's signature.
 	 *
-	 * The signature is over the raw JSON body bytes with the "signature" field's
-	 * value replaced by 64 zero bytes (stable position, no re-serialization needed).
+	 * The signature is computed over the JSON with the "signature" field
+	 * REMOVED (not zeroed). We parse the body, strip the field, re-serialize
+	 * with the same flags both sides use, and verify.
 	 *
-	 * @param string $raw_body     The raw HTTP response body bytes.
-	 * @param string $signature_b64 The signature value from the JSON (base64, ed25519-prefixed).
-	 * @param string $public_key_b64 The signer's public key (base64, ed25519-prefixed).
+	 * @param string $raw_body      The raw HTTP response body.
+	 * @param string $signature_b64  The signature value from the JSON.
+	 * @param string $public_key_b64 The signer's public key.
 	 * @return bool
 	 */
 	public static function verify_command_signature( $raw_body, $signature_b64, $public_key_b64 ) {
-		// The signed bytes are the raw body with the signature VALUE replaced by 64 zero bytes.
-		// The signature field value is a JSON string like "ed25519:base64data".
-		// We replace that string's content with 64 zero bytes (the raw signature size).
-		// In practice: the signature field in JSON is a quoted string. We find it and replace
-		// the base64 content with a fixed-length placeholder of the same byte length.
-
-		// Strategy: extract the signature from JSON, then reconstruct the signed payload
-		// by replacing the signature value in the raw body with the zero-byte placeholder.
-		$sig_value = $signature_b64; // e.g. "ed25519:AAAA..."
-
-		// The signed body = raw body with the signature string value replaced by 64 \0 bytes.
-		// Since JSON serializes the signature as a string, we need to replace the string
-		// value in the raw bytes. We use the known pattern: "signature":"ed25519:..."
-		$zeroed = str_repeat( "\x00", 64 );
-
-		// Replace the signature value in the raw body. The value is a JSON string,
-		// so it appears as: "signature":"<value>" in the body.
-		// We match the signature value and replace it with the zeroed bytes.
-		$pattern      = '/"signature"\s*:\s*"[^"]*"/';
-		$replacement  = '"signature":"' . $zeroed . '"';
-		$signed_bytes = preg_replace( $pattern, $replacement, $raw_body, 1 );
-
-		if ( $signed_bytes === null || $signed_bytes === $raw_body ) {
-			// Pattern didn't match — the signature field wasn't found.
+		$parsed = json_decode( $raw_body, true );
+		if ( ! is_array( $parsed ) ) {
 			return false;
 		}
 
-		return self::verify( $signed_bytes, $signature_b64, $public_key_b64 );
+		// Remove the signature field.
+		unset( $parsed['signature'] );
+
+		// Canonical: sorted keys, unescaped slashes, no spaces.
+		// PHP_JSON_THROW_ON_ERROR would be ideal but requires PHP 7.3+.
+		$canonical = wp_json_encode( $parsed );
+		if ( false === $canonical ) {
+			return false;
+		}
+
+		return self::verify( $canonical, $signature_b64, $public_key_b64 );
 	}
 
 	/**
-	 * Encrypt a value for local at-rest storage using WP salt.
+	 * Encrypt a value for local at-rest storage using WP salt + sodium.
 	 *
-	 * Uses AES-256-CTR with the WP auth salt as key material.
-	 * Not designed to resist a full server compromise (the key is on the same host),
-	 * but protects the secret in DB dumps and backups.
+	 * Uses sodium_crypto_secretbox (XSalsa20-Poly1305 AEAD) for authenticated
+	 * encryption — an attacker modifying the DB value causes decryption to
+	 * fail rather than producing a wrong key.
 	 *
 	 * @param string $plaintext
 	 * @return string
 	 */
 	private static function encrypt_local( $plaintext ) {
-		$key    = hash( 'sha256', wp_salt( 'auth' ), true ); // 32 bytes.
-		$iv     = random_bytes( 16 ); // AES-256-CTR IV = 16 bytes.
-		$ct     = openssl_encrypt( $plaintext, 'aes-256-ctr', $key, OPENSSL_RAW_DATA, $iv );
-		$result = base64_encode( $iv . $ct );
+		$key_material = hash( 'sha256', wp_salt( 'auth' ), true );
+		$key          = sodium_crypto_generichash( '', $key_material, SODIUM_CRYPTO_SECRETBOX_KEYBYTES );
+		$nonce        = random_bytes( SODIUM_CRYPTO_SECRETBOX_NONCEBYTES );
+
+		$encrypted = sodium_crypto_secretbox( $plaintext, $nonce, $key );
+		$result    = base64_encode( $nonce . $encrypted );
 
 		sodium_memzero( $key );
-		sodium_memzero( $iv );
-		sodium_memzero( $ct );
+		sodium_memzero( $key_material );
+		sodium_memzero( $nonce );
+		sodium_memzero( $encrypted );
 
 		return $result;
 	}
@@ -195,17 +177,22 @@ class Felix_Crypto {
 	 */
 	private static function decrypt_local( $ciphertext ) {
 		$raw = base64_decode( $ciphertext, true );
-		if ( $raw === false || strlen( $raw ) < 17 ) {
+		if ( $raw === false || strlen( $raw ) < SODIUM_CRYPTO_SECRETBOX_NONCEBYTES + 1 ) {
 			return false;
 		}
 
-		$iv = substr( $raw, 0, 16 );
-		$ct = substr( $raw, 16 );
+		$key_material = hash( 'sha256', wp_salt( 'auth' ), true );
+		$key          = sodium_crypto_generichash( '', $key_material, SODIUM_CRYPTO_SECRETBOX_KEYBYTES );
 
-		$key     = hash( 'sha256', wp_salt( 'auth' ), true );
-		$plaintext = openssl_decrypt( $ct, 'aes-256-ctr', $key, OPENSSL_RAW_DATA, $iv );
+		$nonce     = substr( $raw, 0, SODIUM_CRYPTO_SECRETBOX_NONCEBYTES );
+		$encrypted = substr( $raw, SODIUM_CRYPTO_SECRETBOX_NONCEBYTES );
+
+		$plaintext = sodium_crypto_secretbox_open( $encrypted, $nonce, $key );
 
 		sodium_memzero( $key );
+		sodium_memzero( $key_material );
+		sodium_memzero( $nonce );
+		sodium_memzero( $encrypted );
 
 		return $plaintext;
 	}
@@ -227,9 +214,9 @@ class Felix_Crypto {
 	/**
 	 * Look up a public key from the key manifest by keyId.
 	 *
-	 * @param array  $manifest The key manifest stored at pairing.
-	 * @param string $key_id   The keyId from the command envelope.
-	 * @return string|null The base64 public key, or null if not found / expired.
+	 * @param array  $manifest
+	 * @param string $key_id
+	 * @return string|null
 	 */
 	public static function lookup_key( $manifest, $key_id ) {
 		if ( ! isset( $manifest['keys'] ) || ! is_array( $manifest['keys'] ) ) {
@@ -243,18 +230,17 @@ class Felix_Crypto {
 				continue;
 			}
 
-			// Check validity window.
 			if ( isset( $key['notBefore'] ) ) {
 				$not_before = strtotime( $key['notBefore'] );
 				if ( $not_before !== false && $now < $not_before ) {
-					continue; // Key not yet valid.
+					continue;
 				}
 			}
 
 			if ( isset( $key['notAfter'] ) && $key['notAfter'] !== null ) {
 				$not_after = strtotime( $key['notAfter'] );
 				if ( $not_after !== false && $now > $not_after ) {
-					continue; // Key expired.
+					continue;
 				}
 			}
 

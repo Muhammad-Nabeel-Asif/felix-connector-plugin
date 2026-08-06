@@ -69,7 +69,7 @@ require_once FELIX_CONNECTOR_PLUGIN_DIR . 'includes/class-felix-runner.php';
 function felix_connector_activate() {
 	// Generate Ed25519 keypair if not present.
 	if ( ! get_option( FELIX_OPT_PLUGIN_KEYPAIR ) ) {
-		$keypair = Felix_Crypto::generate_keypair();
+		$keypair = Felix_Crypto::generate_identity();
 		update_option( FELIX_OPT_PLUGIN_KEYPAIR, $keypair, false );
 	}
 
