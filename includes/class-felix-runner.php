@@ -240,10 +240,11 @@ class Felix_Runner {
 			$this->error_count = 0;
 			$polls++;
 
+			$remaining = max( 0, ( $deadline - time() ) * 1000000 );
 			if ( $this->degraded ) {
-				usleep( min( $this->degraded_poll_interval_ms * 1000, ( $deadline - time() ) * 1000000 ) );
+				usleep( min( $this->degraded_poll_interval_ms * 1000, $remaining ) );
 			} else {
-				usleep( min( $this->min_repoll_delay_ms * 1000, ( $deadline - time() ) * 1000000 ) );
+				usleep( min( $this->min_repoll_delay_ms * 1000, $remaining ) );
 			}
 		}
 
