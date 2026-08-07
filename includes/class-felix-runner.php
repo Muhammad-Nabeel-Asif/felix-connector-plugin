@@ -266,6 +266,13 @@ class Felix_Runner {
 	private function record_run( $status ) {
 		update_option( 'felix_last_run_at', time() );
 		update_option( 'felix_last_run_status', $status );
+
+		// Update local liveness state so the settings page reflects reality.
+		if ( 'success' === $status ) {
+			update_option( FELIX_OPT_LIVENESS_STATE, 'connected' );
+		} elseif ( 'error' === $status && get_option( FELIX_OPT_LIVENESS_STATE ) === 'connected' ) {
+			update_option( FELIX_OPT_LIVENESS_STATE, 'reconnecting' );
+		}
 	}
 
 	/**
