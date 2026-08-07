@@ -1,10 +1,13 @@
 <?php
 /**
- * Felix Runner — the CLI poll loop (the core of the connector).
+ * Felix Runner — the core poll/execute loop for the connector.
  *
- * Launched by runner.php (cron entry point). Holds a DB lease + flock,
- * loops back-to-back long-polls within the window budget, executes
- * commands, posts results.
+ * Supports two invocation contexts:
+ *  1. FELIX_RUNNER_MODE (external server cron via runner.php) — long window loop.
+ *  2. WP-Cron hook (inside WordPress) — short bounded cycle.
+ *
+ * Both paths share the same flock + DB-lease mutex so they cannot
+ * double-execute commands.
  *
  * @package FelixConnector
  */
@@ -15,7 +18,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 class Felix_Runner {
 
-	/** @var int Default runner window in seconds. */
+	/** @var int Default runner window in seconds (CLI mode). */
 	private $window_seconds = 1790;
 
 	/** @var int Default long-poll hold time. */
@@ -54,12 +57,16 @@ class Felix_Runner {
 	/** @var string Log file path. */
 	private $log_file;
 
+	/** @var bool Whether we're running as CLI (affects logging). */
+	private $is_cli;
+
 	/**
 	 * Constructor.
 	 */
 	public function __construct() {
 		$this->holder_id = wp_generate_uuid4();
 		$this->handlers  = new Felix_Command_Handlers();
+		$this->is_cli    = ( defined( 'FELIX_RUNNER_MODE' ) && FELIX_RUNNER_MODE ) || ( php_sapi_name() === 'cli' );
 
 		// Apply host profile overrides.
 		$profile = get_option( FELIX_OPT_HOST_PROFILE, array() );
@@ -81,11 +88,13 @@ class Felix_Runner {
 	}
 
 	/**
-	 * Main run loop.
+	 * Main run loop — CLI / external cron mode.
+	 * Runs the full window_seconds poll loop.
 	 */
 	public function run() {
 		if ( ! Felix_Pairing::is_paired() ) {
 			$this->log( 'Store not paired, exiting.' );
+			$this->record_run( 'skipped' );
 			return;
 		}
 
@@ -93,6 +102,7 @@ class Felix_Runner {
 		$this->lock_handle = @fopen( $this->lock_file, 'c' );
 		if ( ! $this->lock_handle ) {
 			$this->log( 'Could not open lock file.' );
+			$this->record_run( 'error' );
 			return;
 		}
 
@@ -113,6 +123,7 @@ class Felix_Runner {
 			if ( $waited >= 120 ) {
 				$this->log( 'Could not acquire lock after 120s, exiting.' );
 				fclose( $this->lock_handle );
+				$this->record_run( 'skipped' );
 				return;
 			}
 		}
@@ -122,6 +133,7 @@ class Felix_Runner {
 			$this->log( 'Valid lease held by another runner, exiting.' );
 			flock( $this->lock_handle, LOCK_UN );
 			fclose( $this->lock_handle );
+			$this->record_run( 'skipped' );
 			return;
 		}
 
@@ -158,6 +170,101 @@ class Felix_Runner {
 
 		flock( $this->lock_handle, LOCK_UN );
 		fclose( $this->lock_handle );
+
+		$this->record_run( 'success' );
+	}
+
+	/**
+	 * WP-Cron entry point — short bounded cycle.
+	 *
+	 * Does a best-effort acquisition of flock + DB lease, then runs
+	 * a small number of poll cycles within a time budget (~60s).
+	 * If locks cannot be acquired, exits silently (external cron has it).
+	 */
+	public function run_wp_cron() {
+		if ( ! Felix_Pairing::is_paired() ) {
+			$this->record_run( 'skipped' );
+			return;
+		}
+
+		// Time budget for WP-Cron — keep it short to avoid PHP timeouts.
+		$budget_seconds = 50;
+		$max_polls      = 3;
+		$start_time     = time();
+		$deadline       = $start_time + $budget_seconds;
+
+		// Attempt flock acquisition (non-blocking — don't wait).
+		$this->lock_handle = @fopen( $this->lock_file, 'c' );
+		if ( ! $this->lock_handle ) {
+			$this->record_run( 'error' );
+			return;
+		}
+
+		if ( ! flock( $this->lock_handle, LOCK_EX | LOCK_NB ) ) {
+			// External cron (or another WP-Cron process) has the lock.
+			$this->record_run( 'skipped' );
+			fclose( $this->lock_handle );
+			$this->lock_handle = null;
+			return;
+		}
+
+		// Attempt DB lease.
+		if ( ! $this->acquire_lease() ) {
+			$this->record_run( 'skipped' );
+			flock( $this->lock_handle, LOCK_UN );
+			fclose( $this->lock_handle );
+			$this->lock_handle = null;
+			return;
+		}
+
+		$this->log( sprintf( 'WP-Cron cycle started (holder=%s, budget=%ds)', $this->holder_id, $budget_seconds ) );
+
+		$polls = 0;
+		$had_error = false;
+
+		while ( time() < $deadline && $polls < $max_polls ) {
+			$this->renew_lease();
+			update_option( FELIX_OPT_RUNNER_HEARTBEAT, time() );
+
+			$result = $this->poll_once();
+
+			if ( $result === false ) {
+				$this->error_count++;
+				$had_error = true;
+
+				// In WP-Cron, don't do long backoffs — just break after one error.
+				$this->log( sprintf( 'WP-Cron poll error #%d, ending cycle', $this->error_count ) );
+				break;
+			}
+
+			$this->error_count = 0;
+			$polls++;
+
+			if ( $this->degraded ) {
+				usleep( min( $this->degraded_poll_interval_ms * 1000, ( $deadline - time() ) * 1000000 ) );
+			} else {
+				usleep( min( $this->min_repoll_delay_ms * 1000, ( $deadline - time() ) * 1000000 ) );
+			}
+		}
+
+		$this->release_lease();
+		$this->log( sprintf( 'WP-Cron cycle complete (%d polls, %ds)', $polls, time() - $start_time ) );
+
+		flock( $this->lock_handle, LOCK_UN );
+		fclose( $this->lock_handle );
+		$this->lock_handle = null;
+
+		$this->record_run( $had_error ? 'error' : 'success' );
+	}
+
+	/**
+	 * Record run outcome for UI freshness tracking.
+	 *
+	 * @param string $status success|error|skipped
+	 */
+	private function record_run( $status ) {
+		update_option( 'felix_last_run_at', time() );
+		update_option( 'felix_last_run_status', $status );
 	}
 
 	/**
@@ -374,10 +481,10 @@ class Felix_Runner {
 		$headers = array( 'Content-Type' => 'application/json' );
 
 		if ( $secret ) {
-			$sig                          = Felix_Crypto::sign( $body_json, $secret );
-			$headers['X-Felix-Plugin-Sig']  = $sig;
-			$headers['X-Felix-Plugin-KeyId'] = $keypair['publicKey'];
-			$headers['X-Felix-Timestamp']    = (string) ( time() * 1000 );
+			$sig                              = Felix_Crypto::sign( $body_json, $secret );
+			$headers['X-Felix-Plugin-Sig']    = $sig;
+			$headers['X-Felix-Plugin-KeyId']  = $keypair['publicKey'];
+			$headers['X-Felix-Timestamp']     = (string) ( time() * 1000 );
 			sodium_memzero( $secret );
 		}
 
@@ -445,13 +552,17 @@ class Felix_Runner {
 	}
 
 	/**
-	 * Log a message to the log file and STDOUT.
+	 * Log a message to the log file and STDOUT (CLI only).
 	 *
 	 * @param string $message
 	 */
 	private function log( $message ) {
 		$line = sprintf( '[%s] %s', current_time( 'Y-m-d H:i:s' ), $message ) . "\n";
-		fwrite( STDOUT, $line );
+
+		// Only write to STDOUT in CLI mode.
+		if ( $this->is_cli ) {
+			fwrite( STDOUT, $line );
+		}
 
 		// Also write to log file (best-effort).
 		@file_put_contents( $this->log_file, $line, FILE_APPEND | LOCK_EX );

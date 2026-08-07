@@ -108,7 +108,7 @@ class Felix_Settings {
 		update_option( FELIX_OPT_PAIRED, true, false );
 		update_option( FELIX_OPT_LIVENESS_STATE, 'pairing', false );
 
-		add_settings_error( 'felix_connector', 'pair_success', __( 'Store connected to Felix! Set up the cron job below to activate the connector.', 'felix-connector' ), 'updated' );
+		add_settings_error( 'felix_connector', 'pair_success', __( 'Store connected to Felix! The connector will activate automatically within a few minutes.', 'felix-connector' ), 'updated' );
 	}
 
 	private function handle_unpair() {
@@ -123,6 +123,8 @@ class Felix_Settings {
 		delete_option( FELIX_OPT_LIVENESS_STATE );
 		delete_option( FELIX_OPT_RUNNER_HEARTBEAT );
 		delete_option( FELIX_OPT_SEEN_NONCES );
+		delete_option( 'felix_last_run_at' );
+		delete_option( 'felix_last_run_status' );
 
 		add_settings_error( 'felix_connector', 'unpaired', __( 'Store disconnected from Felix.', 'felix-connector' ), 'updated' );
 	}
@@ -180,6 +182,63 @@ class Felix_Settings {
 		return "{$php_binary} {$runner_path} >/dev/null 2>&1";
 	}
 
+	/**
+	 * Determine connection status for the UI.
+	 *
+	 * @return array {status: string, color: string, label: string, show_cron_fallback: bool}
+	 */
+	private function get_connection_status() {
+		$paired     = (bool) get_option( FELIX_OPT_PAIRED, false );
+		$last_run   = (int) get_option( 'felix_last_run_at', 0 );
+		$run_status = get_option( 'felix_last_run_status', '' );
+		$paired_at  = 0; // We don't track pairing timestamp separately; infer from options.
+
+		if ( ! $paired ) {
+			return array(
+				'status'             => 'not_paired',
+				'color'              => 'gray',
+				'label'              => __( 'Not connected', 'felix-connector' ),
+				'show_cron_fallback' => false,
+			);
+		}
+
+		// Check DISABLE_WP_CRON.
+		$wp_cron_disabled = defined( 'DISABLE_WP_CRON' ) && DISABLE_WP_CRON;
+
+		$now = time();
+		$age = $last_run > 0 ? ( $now - $last_run ) : -1;
+
+		// Fresh run (< 15 min) — connected.
+		if ( $age >= 0 && $age < 900 ) {
+			return array(
+				'status'             => 'connected',
+				'color'              => 'green',
+				'label'              => __( 'Connected', 'felix-connector' ),
+				'show_cron_fallback' => false,
+			);
+		}
+
+		// Paired but no run yet, or run < 2 hours old — "Connecting…".
+		if ( $age < 0 || ( $age >= 900 && $age < 7200 ) ) {
+			return array(
+				'status'             => 'connecting',
+				'color'              => 'blue',
+				'label'              => __( 'Connecting… this can take a few minutes', 'felix-connector' ),
+				'show_cron_fallback' => $wp_cron_disabled,
+			);
+		}
+
+		// Run older than 2 hours (or never after 2+ hours) — show cron fallback.
+		return array(
+			'status'             => $wp_cron_disabled ? 'wp_cron_disabled' : 'stale',
+			'color'              => 'orange',
+			'label'              => $wp_cron_disabled
+				? __( 'WP-Cron is disabled — add a server cron job', 'felix-connector' )
+				: __( 'Connection appears inactive — add a server cron job', 'felix-connector' ),
+			'show_cron_fallback' => true,
+		);
+	}
+
 	public function render_page() {
 		$paired    = get_option( FELIX_OPT_PAIRED, false );
 		$store_id  = get_option( FELIX_OPT_STORE_ID, '' );
@@ -187,27 +246,13 @@ class Felix_Settings {
 		$heartbeat = get_option( FELIX_OPT_RUNNER_HEARTBEAT, 0 );
 		$killed    = get_option( FELIX_OPT_KILL_SWITCHES, array() );
 
+		$last_run      = (int) get_option( 'felix_last_run_at', 0 );
+		$last_status   = get_option( 'felix_last_run_status', '' );
+		$wp_cron_disabled = defined( 'DISABLE_WP_CRON' ) && DISABLE_WP_CRON;
+
+		$conn = $this->get_connection_status();
+
 		$stale_seconds = $heartbeat > 0 ? ( time() - intval( $heartbeat ) ) : 0;
-
-		$liveness_labels = array(
-			'pairing'      => __( 'Connecting…', 'felix-connector' ),
-			'observing'    => __( 'Verifying connection…', 'felix-connector' ),
-			'connected'    => __( 'Connected', 'felix-connector' ),
-			'reconnecting' => __( 'Reconnecting', 'felix-connector' ),
-			'degraded'     => __( 'Degraded', 'felix-connector' ),
-			'offline'      => __( 'Offline', 'felix-connector' ),
-			'unknown'      => __( 'Not connected', 'felix-connector' ),
-		);
-
-		$liveness_colors = array(
-			'connected'    => 'green',
-			'reconnecting' => 'orange',
-			'degraded'     => 'orange',
-			'offline'      => 'red',
-			'pairing'      => 'blue',
-			'observing'    => 'blue',
-			'unknown'      => 'gray',
-		);
 
 		$families = array(
 			'order_read'          => __( 'Order lookups (read-only)', 'felix-connector' ),
@@ -272,15 +317,15 @@ class Felix_Settings {
 				</div>
 
 			<?php else : ?>
-				<!-- CONNECTED STATUS -->
+				<!-- CONNECTION STATUS CARD (happy path) -->
 				<div class="card">
 					<h2><?php esc_html_e( 'Connection Status', 'felix-connector' ); ?></h2>
 					<table class="form-table">
 						<tr>
 							<th><?php esc_html_e( 'Status', 'felix-connector' ); ?></th>
 							<td>
-								<span style="color: <?php echo esc_attr( $liveness_colors[ $liveness ] ?? 'gray' ); ?>; font-weight: bold;">
-									● <?php echo esc_html( $liveness_labels[ $liveness ] ?? $liveness ); ?>
+								<span style="color: <?php echo esc_attr( $conn['color'] ); ?>; font-weight: bold; font-size: 14px;">
+									● <?php echo esc_html( $conn['label'] ); ?>
 								</span>
 							</td>
 						</tr>
@@ -288,25 +333,30 @@ class Felix_Settings {
 							<th><?php esc_html_e( 'Store ID', 'felix-connector' ); ?></th>
 							<td><code><?php echo esc_html( $store_id ); ?></code></td>
 						</tr>
+						<?php if ( $last_run > 0 ) : ?>
 						<tr>
-							<th><?php esc_html_e( 'Last heartbeat', 'felix-connector' ); ?></th>
+							<th><?php esc_html_e( 'Last activity', 'felix-connector' ); ?></th>
 							<td>
 								<?php
-								if ( $stale_seconds > 0 ) {
-									if ( $stale_seconds > 1800 ) {
-										echo '<span style="color: red;">' . esc_html( sprintf( __( '%d minutes ago — cron may not be running!', 'felix-connector' ), intval( $stale_seconds / 60 ) ) ) . '</span>';
-									} elseif ( $stale_seconds > 90 ) {
-										echo '<span style="color: orange;">' . esc_html( sprintf( __( '%d seconds ago', 'felix-connector' ), $stale_seconds ) ) . '</span>';
-									} else {
-										echo '<span style="color: green;">' . esc_html( sprintf( __( '%d seconds ago', 'felix-connector' ), $stale_seconds ) ) . '</span>';
-									}
+								$run_age = time() - $last_run;
+								if ( $run_age < 60 ) {
+									echo esc_html( sprintf( __( '%d seconds ago', 'felix-connector' ), $run_age ) );
+								} elseif ( $run_age < 3600 ) {
+									echo esc_html( sprintf( __( '%d minutes ago', 'felix-connector' ), intval( $run_age / 60 ) ) );
 								} else {
-									echo '<span style="color: red;">' . esc_html__( 'Never — cron job is not set up yet. See instructions below.', 'felix-connector' ) . '</span>';
+									echo esc_html( sprintf( __( '%d hours ago', 'felix-connector' ), intval( $run_age / 3600 ) ) );
 								}
 								?>
 							</td>
 						</tr>
+						<?php endif; ?>
 					</table>
+
+					<?php if ( 'connecting' === $conn['status'] ) : ?>
+						<p style="margin-top: 10px; padding: 10px; background: #e8f4fd; border-left: 4px solid #2271b1;">
+							ℹ️ <?php esc_html_e( 'Felix connects automatically — no setup needed. The connector activates when someone visits your site. This page view has already triggered it; check back in a few minutes.', 'felix-connector' ); ?>
+						</p>
+					<?php endif; ?>
 
 					<form method="post" action="" style="margin-top: 15px;">
 						<?php wp_nonce_field( 'felix_connector_settings' ); ?>
@@ -315,11 +365,22 @@ class Felix_Settings {
 					</form>
 				</div>
 
-				<!-- CRON SETUP -->
-				<div class="card" style="margin-top: 20px;">
-					<h2><?php esc_html_e( 'Cron Job Setup (Required)', 'felix-connector' ); ?></h2>
-					<p><?php esc_html_e( 'For the connector to work, you need to create a cron job on your server. Copy this command:', 'felix-connector' ); ?></p>
+				<?php
+				// EXCEPTION PATH: show server cron setup ONLY when needed.
+				$show_cron = $conn['show_cron_fallback'];
+				if ( $show_cron ) :
+				?>
+				<!-- SERVER CRON FALLBACK (exception path only) -->
+				<div class="card" style="margin-top: 20px; border-left: 4px solid #dba617;">
+					<h2>⚙️ <?php esc_html_e( 'Add a Server Cron Job for Reliable Operation', 'felix-connector' ); ?></h2>
 
+					<?php if ( $wp_cron_disabled ) : ?>
+						<p><?php esc_html_e( 'Your WordPress site has DISABLE_WP_CRON set, which prevents the connector from running automatically. Add a server cron job to keep Felix connected.', 'felix-connector' ); ?></p>
+					<?php else : ?>
+						<p><?php esc_html_e( 'Your site appears to have low traffic or WP-Cron is not firing reliably. Adding a server cron job ensures Felix stays connected.', 'felix-connector' ); ?></p>
+					<?php endif; ?>
+
+					<p><?php esc_html_e( 'Copy this command:', 'felix-connector' ); ?></p>
 					<p>
 						<input type="text" readonly id="felix-cron-command" class="large-text code" value="<?php echo esc_attr( $cron_command ); ?>" style="font-family: monospace; font-size: 13px;">
 					</p>
@@ -329,15 +390,16 @@ class Felix_Settings {
 						</button>
 					</p>
 
-					<h3><?php esc_html_e( 'How to add the cron job:', 'felix-connector' ); ?></h3>
-					<p><strong><?php esc_html_e( 'SiteGround:', 'felix-connector' ); ?></strong> <?php esc_html_e( 'Site Tools → Devs → Cron Jobs → Add New. Set to run every 30 minutes. Paste the command above.', 'felix-connector' ); ?></p>
-					<p><strong><?php esc_html_e( 'cPanel:', 'felix-connector' ); ?></strong> <?php esc_html_e( 'Advanced → Cron Jobs → Add New Cron Job. Set to */30 in the minute field, * in all others. Paste the command above.', 'felix-connector' ); ?></p>
-					<p><strong><?php esc_html_e( 'WP-CLI:', 'felix-connector' ); ?></strong> <?php esc_html_e( 'If you have SSH access, add to your server crontab via "crontab -e" with the schedule 30 minutes.', 'felix-connector' ); ?></p>
-
-					<p style="margin-top: 15px; padding: 10px; background: #fff8e5; border-left: 4px solid #dba617;">
-						⚠️ <?php esc_html_e( 'The connector will not work until this cron job is configured. After adding it, wait 2 minutes and refresh this page — the heartbeat above should update.', 'felix-connector' ); ?>
-					</p>
+					<details style="margin-top: 15px;">
+						<summary style="cursor: pointer; font-weight: bold;"><?php esc_html_e( 'How to add the cron job', 'felix-connector' ); ?></summary>
+						<div style="margin-top: 10px; padding-left: 15px;">
+							<p><strong><?php esc_html_e( 'SiteGround:', 'felix-connector' ); ?></strong> <?php esc_html_e( 'Site Tools → Devs → Cron Jobs → Add New. Set to run every 30 minutes. Paste the command above.', 'felix-connector' ); ?></p>
+							<p><strong><?php esc_html_e( 'cPanel:', 'felix-connector' ); ?></strong> <?php esc_html_e( 'Advanced → Cron Jobs → Add New Cron Job. Set to */30 in the minute field, * in all others. Paste the command above.', 'felix-connector' ); ?></p>
+							<p><strong><?php esc_html_e( 'WP-CLI / SSH:', 'felix-connector' ); ?></strong> <?php esc_html_e( 'Run "crontab -e" and add the command with a 30-minute schedule.', 'felix-connector' ); ?></p>
+						</div>
+					</details>
 				</div>
+				<?php endif; ?>
 
 				<!-- KILL SWITCHES -->
 				<div class="card" style="margin-top: 20px;">
@@ -364,32 +426,60 @@ class Felix_Settings {
 					</form>
 				</div>
 
-				<!-- TROUBLESHOOTING -->
-				<div class="card" style="margin-top: 20px;">
-					<h2><?php esc_html_e( 'Troubleshooting', 'felix-connector' ); ?></h2>
-					<table class="form-table">
-						<tr>
-							<th><?php esc_html_e( 'WordPress path', 'felix-connector' ); ?></th>
-							<td><code><?php echo esc_html( ABSPATH ); ?></code></td>
-						</tr>
-						<tr>
-							<th><?php esc_html_e( 'Plugin path', 'felix-connector' ); ?></th>
-							<td><code><?php echo esc_html( FELIX_CONNECTOR_PLUGIN_DIR ); ?></code></td>
-						</tr>
-						<tr>
-							<th><?php esc_html_e( 'PHP binary', 'felix-connector' ); ?></th>
-							<td><code><?php echo esc_html( PHP_BINARY ); ?></code></td>
-						</tr>
-						<tr>
-							<th><?php esc_html_e( 'PHP version', 'felix-connector' ); ?></th>
-							<td><code><?php echo esc_html( PHP_VERSION ); ?></code></td>
-						</tr>
-						<tr>
-							<th><?php esc_html_e( 'Log file', 'felix-connector' ); ?></th>
-							<td><code><?php echo esc_html( WP_CONTENT_DIR . '/uploads/felix-connector.log' ); ?></code></td>
-						</tr>
-					</table>
-				</div>
+				<!-- ADVANCED / TROUBLESHOOTING (collapsed) -->
+				<details style="margin-top: 20px;">
+					<summary style="cursor: pointer; font-size: 14px; color: #2271b1; font-weight: bold;"><?php esc_html_e( 'Advanced & Troubleshooting', 'felix-connector' ); ?></summary>
+					<div class="card" style="margin-top: 10px;">
+						<h3><?php esc_html_e( 'Advanced: Server Cron (Optional)', 'felix-connector' ); ?></h3>
+						<p><?php esc_html_e( 'For high-reliability setups, you can optionally add a server cron job to run the connector independently of site traffic. This is not required for normal operation.', 'felix-connector' ); ?></p>
+						<p><input type="text" readonly class="large-text code" value="<?php echo esc_attr( $cron_command ); ?>" style="font-family: monospace; font-size: 13px;" onclick="this.select();"></p>
+
+						<hr style="margin: 20px 0;">
+
+						<h3><?php esc_html_e( 'Diagnostics', 'felix-connector' ); ?></h3>
+						<table class="form-table">
+							<tr>
+								<th><?php esc_html_e( 'WP-Cron status', 'felix-connector' ); ?></th>
+								<td>
+									<?php if ( $wp_cron_disabled ) : ?>
+										<span style="color: red;">⚠️ <?php esc_html_e( 'DISABLE_WP_CRON is true — WP-Cron will not fire on page loads.', 'felix-connector' ); ?></span>
+									<?php else : ?>
+										<span style="color: green;">✅ <?php esc_html_e( 'Active (triggered by site traffic)', 'felix-connector' ); ?></span>
+									<?php endif; ?>
+								</td>
+							</tr>
+							<tr>
+								<th><?php esc_html_e( 'Next scheduled run', 'felix-connector' ); ?></th>
+								<td>
+									<?php
+									$next = wp_next_scheduled( 'felix_connector_cron' );
+									echo $next ? esc_html( gmdate( 'Y-m-d H:i:s', $next + ( get_option( 'gmt_offset' ) * HOUR_IN_SECONDS ) ) ) : esc_html__( 'Not scheduled', 'felix-connector' );
+									?>
+								</td>
+							</tr>
+							<tr>
+								<th><?php esc_html_e( 'WordPress path', 'felix-connector' ); ?></th>
+								<td><code><?php echo esc_html( ABSPATH ); ?></code></td>
+							</tr>
+							<tr>
+								<th><?php esc_html_e( 'Plugin path', 'felix-connector' ); ?></th>
+								<td><code><?php echo esc_html( FELIX_CONNECTOR_PLUGIN_DIR ); ?></code></td>
+							</tr>
+							<tr>
+								<th><?php esc_html_e( 'PHP binary', 'felix-connector' ); ?></th>
+								<td><code><?php echo esc_html( PHP_BINARY ); ?></code></td>
+							</tr>
+							<tr>
+								<th><?php esc_html_e( 'PHP version', 'felix-connector' ); ?></th>
+								<td><code><?php echo esc_html( PHP_VERSION ); ?></code></td>
+							</tr>
+							<tr>
+								<th><?php esc_html_e( 'Log file', 'felix-connector' ); ?></th>
+								<td><code><?php echo esc_html( WP_CONTENT_DIR . '/uploads/felix-connector.log' ); ?></code></td>
+							</tr>
+						</table>
+					</div>
+				</details>
 
 			<?php endif; ?>
 		</div>

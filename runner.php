@@ -1,11 +1,14 @@
 <?php
 /**
- * Felix Connector Runner — CLI entry point.
+ * Felix Connector Runner — optional CLI entry point for server cron.
  *
- * Launched by system cron. Bootstraps WordPress, then runs the poll loop.
+ * The connector runs automatically via WP-Cron. This file is only needed
+ * for advanced setups (high-reliability, low-traffic sites, or when
+ * DISABLE_WP_CRON is set). It bootstraps WordPress, then runs the full
+ * long-window poll loop.
  *
- * Usage in crontab (replace the angle brackets):
- *   <every-30-min> * * * * /usr/bin/php /path/to/.../runner.php >/dev/null 2>&1
+ * Usage in crontab:
+ *   every-30-min * * * * /usr/bin/php /path/to/.../runner.php >/dev/null 2>&1
  *
  * @package FelixConnector
  */

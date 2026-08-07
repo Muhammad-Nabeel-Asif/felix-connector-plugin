@@ -3,7 +3,7 @@
  * Plugin Name:       Felix Connector
  * Plugin URI:        https://agentfelix.ai
  * Description:       Connects your WooCommerce store to Felix (agentfelix.ai). Felix executes commands locally via outbound-only communication — your store's host firewall is never bypassed.
- * Version:           0.1.0
+ * Version:           0.2.0
  * Requires at least: 6.0
  * Requires PHP:      8.1
  * Author:            Felix
@@ -19,7 +19,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-// CLI runner entry point — loaded outside WP context by cron.
+// CLI runner entry point — loaded outside WP context by server cron.
 if ( defined( 'FELIX_RUNNER_MODE' ) && FELIX_RUNNER_MODE ) {
 	require_once __DIR__ . '/includes/class-felix-runner.php';
 	$runner = new Felix_Runner();
@@ -27,7 +27,7 @@ if ( defined( 'FELIX_RUNNER_MODE' ) && FELIX_RUNNER_MODE ) {
 	exit;
 }
 
-define( 'FELIX_CONNECTOR_VERSION', '0.1.0' );
+define( 'FELIX_CONNECTOR_VERSION', '0.2.0' );
 define( 'FELIX_CONNECTOR_PLUGIN_FILE', __FILE__ );
 define( 'FELIX_CONNECTOR_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'FELIX_CONNECTOR_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
@@ -63,8 +63,20 @@ require_once FELIX_CONNECTOR_PLUGIN_DIR . 'includes/class-felix-settings.php';
 require_once FELIX_CONNECTOR_PLUGIN_DIR . 'includes/class-felix-pairing.php';
 require_once FELIX_CONNECTOR_PLUGIN_DIR . 'includes/class-felix-runner.php';
 
+// Add custom cron schedule.
+add_filter(
+	'cron_schedules',
+	function ( $schedules ) {
+		$schedules['five_minutes'] = array(
+			'interval' => 300,
+			'display'  => __( 'Every 5 Minutes', 'felix-connector' ),
+		);
+		return $schedules;
+	}
+);
+
 /**
- * Activation hook — generate keypair, create command ledger table.
+ * Activation hook — generate keypair, create command ledger table, schedule WP-Cron.
  */
 function felix_connector_activate() {
 	// Generate Ed25519 keypair if not present.
@@ -86,7 +98,12 @@ function felix_connector_activate() {
 		update_option( FELIX_OPT_KILL_SWITCHES, array(), false );
 	}
 
-	// Schedule wp-cron watchdog.
+	// Schedule WP-Cron runner event.
+	if ( ! wp_next_scheduled( 'felix_connector_cron' ) ) {
+		wp_schedule_event( time(), 'five_minutes', 'felix_connector_cron' );
+	}
+
+	// Schedule watchdog (keep existing).
 	if ( ! wp_next_scheduled( 'felix_connector_watchdog' ) ) {
 		wp_schedule_event( time(), 'five_minutes', 'felix_connector_watchdog' );
 	}
@@ -104,15 +121,52 @@ function felix_connector_add_settings_link( $links ) {
 add_filter( 'plugin_action_links_' . plugin_basename( __FILE__ ), 'felix_connector_add_settings_link' );
 
 /**
- * Deactivation hook — clean up schedules.
+ * Deactivation hook — clean up all scheduled events.
  */
 function felix_connector_deactivate() {
-	$timestamp = wp_next_scheduled( 'felix_connector_watchdog' );
-	if ( $timestamp ) {
-		wp_unschedule_event( $timestamp, 'felix_connector_watchdog' );
+	// Clear WP-Cron runner event.
+	$cron_timestamp = wp_next_scheduled( 'felix_connector_cron' );
+	if ( $cron_timestamp ) {
+		wp_unschedule_event( $cron_timestamp, 'felix_connector_cron' );
 	}
+	wp_clear_scheduled_hook( 'felix_connector_cron' );
+
+	// Clear watchdog event.
+	$watchdog_timestamp = wp_next_scheduled( 'felix_connector_watchdog' );
+	if ( $watchdog_timestamp ) {
+		wp_unschedule_event( $watchdog_timestamp, 'felix_connector_watchdog' );
+	}
+	wp_clear_scheduled_hook( 'felix_connector_watchdog' );
 }
 register_deactivation_hook( __FILE__, 'felix_connector_deactivate' );
+
+/**
+ * Self-healing: ensure WP-Cron event is registered on every init.
+ * Catches cases where the event was lost (manual unschedule, migration, etc.).
+ */
+function felix_connector_ensure_cron_scheduled() {
+	if ( ! wp_next_scheduled( 'felix_connector_cron' ) ) {
+		wp_schedule_event( time(), 'five_minutes', 'felix_connector_cron' );
+	}
+}
+add_action( 'init', 'felix_connector_ensure_cron_scheduled' );
+
+/**
+ * WP-Cron runner callback — short bounded poll cycle.
+ *
+ * Fires every 5 minutes via WP-Cron (triggered by site traffic).
+ * Shares the same flock + DB-lease mutex as the external CLI runner,
+ * so both can coexist without double-executing commands.
+ */
+function felix_connector_cron_runner() {
+	if ( ! get_option( FELIX_OPT_PAIRED ) ) {
+		return;
+	}
+
+	$runner = new Felix_Runner();
+	$runner->run_wp_cron();
+}
+add_action( 'felix_connector_cron', 'felix_connector_cron_runner' );
 
 /**
  * wp-cron watchdog — best-effort diagnostics only.
@@ -157,18 +211,6 @@ function felix_connector_watchdog() {
 	}
 }
 add_action( 'felix_connector_watchdog', 'felix_connector_watchdog' );
-
-// Add custom cron schedule.
-add_filter(
-	'cron_schedules',
-	function ( $schedules ) {
-		$schedules['five_minutes'] = array(
-			'interval' => 300,
-			'display'  => __( 'Every 5 Minutes', 'felix-connector' ),
-		);
-		return $schedules;
-	}
-);
 
 // Initialize settings page.
 new Felix_Settings();
