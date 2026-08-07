@@ -108,7 +108,7 @@ class Felix_Settings {
 		update_option( FELIX_OPT_PAIRED, true, false );
 		update_option( FELIX_OPT_LIVENESS_STATE, 'pairing', false );
 
-		add_settings_error( 'felix_connector', 'pair_success', __( 'Store connected to Felix! The connector will activate automatically within a few minutes.', 'felix-connector' ), 'updated' );
+		add_settings_error( 'felix_connector', 'pair_success', __( 'Store connected to Felix! The connector will activate automatically — usually within seconds.', 'felix-connector' ), 'updated' );
 	}
 
 	private function handle_unpair() {
@@ -223,7 +223,7 @@ class Felix_Settings {
 			return array(
 				'status'             => 'connecting',
 				'color'              => 'blue',
-				'label'              => __( 'Connecting… this can take a few minutes', 'felix-connector' ),
+				'label'              => __( 'Connecting…', 'felix-connector' ),
 				'show_cron_fallback' => $wp_cron_disabled,
 			);
 		}
@@ -354,8 +354,11 @@ class Felix_Settings {
 
 					<?php if ( 'connecting' === $conn['status'] ) : ?>
 						<p style="margin-top: 10px; padding: 10px; background: #e8f4fd; border-left: 4px solid #2271b1;">
-							ℹ️ <?php esc_html_e( 'Felix connects automatically — no setup needed. The connector activates when someone visits your site. This page view has already triggered it; check back in a few minutes.', 'felix-connector' ); ?>
+							ℹ️ <?php esc_html_e( 'Felix connects automatically — no setup needed. This page view has already triggered the connection; it should update shortly.', 'felix-connector' ); ?>
 						</p>
+						<script>
+							setTimeout(function() { window.location.reload(); }, 5000);
+						</script>
 					<?php endif; ?>
 
 					<form method="post" action="" style="margin-top: 15px;">
