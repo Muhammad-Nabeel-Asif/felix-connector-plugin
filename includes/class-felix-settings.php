@@ -235,7 +235,7 @@ class Felix_Settings {
 				<!-- PAIRING FORM -->
 				<div class="card">
 					<h2><?php esc_html_e( 'Connect to Felix', 'felix-connector' ); ?></h2>
-					<p><?php esc_html_e( 'Enter the pairing code from your Felix dashboard to connect this store.', 'felix-connector' ); ?></p>
+					<p><?php esc_html_e( 'Enter the pairing code from Felix to connect this store.', 'felix-connector' ); ?></p>
 
 					<form method="post" action="">
 						<?php wp_nonce_field( 'felix_connector_settings' ); ?>
