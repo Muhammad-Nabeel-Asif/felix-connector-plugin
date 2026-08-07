@@ -94,6 +94,16 @@ function felix_connector_activate() {
 register_activation_hook( __FILE__, 'felix_connector_activate' );
 
 /**
+ * Add "Settings" link on the Plugins list page.
+ */
+function felix_connector_add_settings_link( $links ) {
+	$settings_link = '<a href="' . esc_url( admin_url( 'admin.php?page=felix-connector' ) ) . '">' . __( 'Settings', 'felix-connector' ) . '</a>';
+	array_unshift( $links, $settings_link );
+	return $links;
+}
+add_filter( 'plugin_action_links_' . plugin_basename( __FILE__ ), 'felix_connector_add_settings_link' );
+
+/**
  * Deactivation hook — clean up schedules.
  */
 function felix_connector_deactivate() {
