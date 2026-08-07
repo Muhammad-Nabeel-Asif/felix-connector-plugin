@@ -5,7 +5,7 @@
  * Description:       Connects your WooCommerce store to Felix (agentfelix.ai). Felix executes commands locally via outbound-only communication — your store's host firewall is never bypassed.
  * Version:           0.2.0
  * Requires at least: 6.0
- * Requires PHP:      8.1
+ * Requires PHP:      7.4
  * Author:            Felix
  * License:           GPL-2.0-or-later
  * License URI:       https://www.gnu.org/licenses/gpl-2.0.html
