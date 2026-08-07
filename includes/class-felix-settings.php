@@ -233,8 +233,8 @@ class Felix_Settings {
 			'status'             => $wp_cron_disabled ? 'wp_cron_disabled' : 'stale',
 			'color'              => 'orange',
 			'label'              => $wp_cron_disabled
-				? __( 'WP-Cron is disabled — add a server cron job', 'felix-connector' )
-				: __( 'Connection appears inactive — add a server cron job', 'felix-connector' ),
+				? __( 'WP-Cron is disabled — add a scheduled task to keep Felix connected', 'felix-connector' )
+				: __( 'Connection appears inactive — add a scheduled task to keep it running', 'felix-connector' ),
 			'show_cron_fallback' => true,
 		);
 	}
@@ -372,12 +372,12 @@ class Felix_Settings {
 				?>
 				<!-- SERVER CRON FALLBACK (exception path only) -->
 				<div class="card" style="margin-top: 20px; border-left: 4px solid #dba617;">
-					<h2>⚙️ <?php esc_html_e( 'Add a Server Cron Job for Reliable Operation', 'felix-connector' ); ?></h2>
+					<h2>⚙️ <?php esc_html_e( 'Add a Scheduled Task for Reliable Operation', 'felix-connector' ); ?></h2>
 
 					<?php if ( $wp_cron_disabled ) : ?>
-						<p><?php esc_html_e( 'Your WordPress site has DISABLE_WP_CRON set, which prevents the connector from running automatically. Add a server cron job to keep Felix connected.', 'felix-connector' ); ?></p>
+						<p><?php esc_html_e( 'Your WordPress site has DISABLE_WP_CRON set, which prevents the connector from running automatically. Add a scheduled task — a small instruction that tells your web host to run something automatically on a timer — to keep Felix connected.', 'felix-connector' ); ?></p>
 					<?php else : ?>
-						<p><?php esc_html_e( 'Your site appears to have low traffic or WP-Cron is not firing reliably. Adding a server cron job ensures Felix stays connected.', 'felix-connector' ); ?></p>
+						<p><?php esc_html_e( 'Your site appears to have low traffic or the WordPress built-in scheduler (which runs automatically whenever people visit your site) is not firing reliably. Adding a scheduled task — also called a cron job — ensures Felix stays connected.', 'felix-connector' ); ?></p>
 					<?php endif; ?>
 
 					<p><?php esc_html_e( 'Copy this command:', 'felix-connector' ); ?></p>
@@ -391,11 +391,11 @@ class Felix_Settings {
 					</p>
 
 					<details style="margin-top: 15px;">
-						<summary style="cursor: pointer; font-weight: bold;"><?php esc_html_e( 'How to add the cron job', 'felix-connector' ); ?></summary>
+						<summary style="cursor: pointer; font-weight: bold;"><?php esc_html_e( 'How to add the scheduled task', 'felix-connector' ); ?></summary>
 						<div style="margin-top: 10px; padding-left: 15px;">
-							<p><strong><?php esc_html_e( 'SiteGround:', 'felix-connector' ); ?></strong> <?php esc_html_e( 'Site Tools → Devs → Cron Jobs → Add New. Set to run every 30 minutes. Paste the command above.', 'felix-connector' ); ?></p>
-							<p><strong><?php esc_html_e( 'cPanel:', 'felix-connector' ); ?></strong> <?php esc_html_e( 'Advanced → Cron Jobs → Add New Cron Job. Set to */30 in the minute field, * in all others. Paste the command above.', 'felix-connector' ); ?></p>
-							<p><strong><?php esc_html_e( 'WP-CLI / SSH:', 'felix-connector' ); ?></strong> <?php esc_html_e( 'Run "crontab -e" and add the command with a 30-minute schedule.', 'felix-connector' ); ?></p>
+							<p><strong><?php esc_html_e( 'SiteGround:', 'felix-connector' ); ?></strong> <?php esc_html_e( 'Site Tools → Devs → Cron Jobs → Add New. Set to run every 5 minutes. Paste the command above.', 'felix-connector' ); ?></p>
+							<p><strong><?php esc_html_e( 'cPanel:', 'felix-connector' ); ?></strong> <?php esc_html_e( 'Advanced → Cron Jobs → Add New Cron Job. Set to */5 in the minute field, * in all others. Paste the command above.', 'felix-connector' ); ?></p>
+							<p><strong><?php esc_html_e( 'WP-CLI / SSH:', 'felix-connector' ); ?></strong> <?php esc_html_e( 'Run "crontab -e" and add the command with a 5-minute schedule.', 'felix-connector' ); ?></p>
 						</div>
 					</details>
 				</div>
@@ -430,8 +430,8 @@ class Felix_Settings {
 				<details style="margin-top: 20px;">
 					<summary style="cursor: pointer; font-size: 14px; color: #2271b1; font-weight: bold;"><?php esc_html_e( 'Advanced & Troubleshooting', 'felix-connector' ); ?></summary>
 					<div class="card" style="margin-top: 10px;">
-						<h3><?php esc_html_e( 'Advanced: Server Cron (Optional)', 'felix-connector' ); ?></h3>
-						<p><?php esc_html_e( 'For high-reliability setups, you can optionally add a server cron job to run the connector independently of site traffic. This is not required for normal operation.', 'felix-connector' ); ?></p>
+						<h3><?php esc_html_e( 'Advanced: Scheduled Task (Optional)', 'felix-connector' ); ?></h3>
+						<p><?php esc_html_e( 'For high-reliability setups, you can optionally add a scheduled task (a small instruction that tells your web host to run something automatically on a timer) to run the connector independently of site traffic. This is not required for normal operation.', 'felix-connector' ); ?></p>
 						<p><input type="text" readonly class="large-text code" value="<?php echo esc_attr( $cron_command ); ?>" style="font-family: monospace; font-size: 13px;" onclick="this.select();"></p>
 
 						<hr style="margin: 20px 0;">
@@ -439,12 +439,12 @@ class Felix_Settings {
 						<h3><?php esc_html_e( 'Diagnostics', 'felix-connector' ); ?></h3>
 						<table class="form-table">
 							<tr>
-								<th><?php esc_html_e( 'WP-Cron status', 'felix-connector' ); ?></th>
+								<th><?php esc_html_e( 'WordPress scheduler', 'felix-connector' ); ?></th>
 								<td>
 									<?php if ( $wp_cron_disabled ) : ?>
-										<span style="color: red;">⚠️ <?php esc_html_e( 'DISABLE_WP_CRON is true — WP-Cron will not fire on page loads.', 'felix-connector' ); ?></span>
+										<span style="color: red;">⚠️ <?php esc_html_e( 'The built-in scheduler is disabled (DISABLE_WP_CRON is set). It will not fire on page loads.', 'felix-connector' ); ?></span>
 									<?php else : ?>
-										<span style="color: green;">✅ <?php esc_html_e( 'Active (triggered by site traffic)', 'felix-connector' ); ?></span>
+										<span style="color: green;">✅ <?php esc_html_e( 'Active (runs automatically when people visit your site)', 'felix-connector' ); ?></span>
 									<?php endif; ?>
 								</td>
 							</tr>

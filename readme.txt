@@ -18,7 +18,7 @@ Felix is an AI-powered customer service and executive operating partner for WooC
 
 Your store initiates all communication to Felix — Felix never makes inbound requests to your store. This means the connector works behind any host firewall, captcha system, or security layer (SiteGround Anti-Bot, Cloudflare, Wordfence, and others).
 
-The connector runs automatically via WordPress's built-in WP-Cron system — no server configuration needed. It activates on the first page visit after pairing and continues running in the background as long as your site receives traffic.
+The connector runs automatically via WordPress's built-in scheduler (which runs whenever people visit your site) — no server configuration needed. It activates on the first page visit after pairing and continues running in the background as long as your site receives traffic.
 
 Felix executes typed, validated commands only. There is no generic executor — every action is a specific, hand-written handler. You can disable any command family at any time from the plugin settings.
 
@@ -47,7 +47,7 @@ Felix executes typed, validated commands only. There is no generic executor — 
 4. Enter the pairing code from your Felix dashboard at [agentfelix.ai](https://agentfelix.ai).
 5. Done! The connector activates automatically within a few minutes.
 
-No server configuration, cron jobs, or SSH access required. The connector runs via WordPress's built-in scheduling system and activates on the first page visit after pairing.
+No server configuration or SSH access required. The connector runs via WordPress's built-in scheduler (which runs automatically whenever people visit your site) and activates on the first page visit after pairing.
 
 == Frequently Asked Questions ==
 
@@ -63,25 +63,25 @@ No. Your store contacts Felix — never the other way around. This is by design:
 
 At pairing, the plugin generates an Ed25519 keypair. The private key never leaves your store. Felix signs every command with its own key, and the plugin verifies each signature before executing. Both sides authenticate each other.
 
-= Do I need to set up a cron job? =
+= Do I need to set up a scheduled task? =
 
-No. The connector runs automatically via WP-Cron, which is triggered by your site's normal traffic. In rare cases (very low traffic sites, or DISABLE_WP_CRON set in wp-config.php), a server cron job may be needed — the plugin will detect this and show instructions on the settings page.
+No. The connector runs automatically via WordPress's built-in scheduler, which fires whenever people visit your site. In rare cases (very low-traffic sites, or DISABLE_WP_CRON set in wp-config.php), a scheduled task — also called a cron job — may be needed. The plugin will detect this and show step-by-step instructions on the settings page.
 
 = Can I disable specific actions? =
 
 Yes. Go to WooCommerce → Felix Connector → Command Permissions and check any family you want to disable.
 
-== Advanced: Server Cron (Optional) ==
+== Advanced: Scheduled Task (Optional) ==
 
-For high-reliability or low-traffic setups, you can optionally add a server cron job to run the connector independently of site traffic. This replaces (or supplements) the built-in WP-Cron scheduling.
+For high-reliability or low-traffic setups, you can optionally add a scheduled task (a small instruction that tells your web host to run something automatically on a timer) to run the connector independently of site traffic. This replaces (or supplements) the WordPress built-in scheduler.
 
 Copy the cron command from WooCommerce → Felix Connector → Advanced & Troubleshooting, then add it to your server:
 
-* **SiteGround:** Site Tools → Devs → Cron Jobs → Add New. Set to run every 30 minutes.
-* **cPanel:** Advanced → Cron Jobs. Set to */30 in the minute field, * in all others.
-* **WP-CLI / SSH:** Add to your crontab with a 30-minute schedule.
+* **SiteGround:** Site Tools → Devs → Cron Jobs → Add New. Set to run every 5 minutes.
+* **cPanel:** Advanced → Cron Jobs. Set to */5 in the minute field, * in all others.
+* **WP-CLI / SSH:** Add to your crontab with a 5-minute schedule.
 
-The server cron and WP-Cron can coexist safely — they share a lock so commands are never double-executed.
+A scheduled task and the WordPress built-in scheduler can coexist safely — they share a lock so commands are never double-executed.
 
 == Changelog ==
 
