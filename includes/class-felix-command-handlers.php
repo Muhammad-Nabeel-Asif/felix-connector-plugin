@@ -301,9 +301,15 @@ class Felix_Command_Handlers {
 				'limit'    => $limit,
 				'orderby'  => 'date',
 				'order'    => 'DESC',
-				'customer' => $email,
+				'search'   => $email,
 			)
 		);
+
+		// WC 'search' is fuzzy (matches name/email/etc), so filter to EXACT billing-email matches.
+		$email_lower = strtolower( $email );
+		$orders = array_filter( $orders, function ( $order ) use ( $email_lower ) {
+			return strtolower( $order->get_billing_email() ) === $email_lower;
+		} );
 
 		$serialized = array();
 		foreach ( $orders as $order ) {
