@@ -61,7 +61,10 @@ class Felix_Command_Ledger {
 	}
 
 	/**
-	 * Record a command execution.
+	 * Record a command execution (legacy single-shot insert).
+	 *
+	 * Kept for back-compat. New code uses reserve() + mark_terminal() so the
+	 * reservation is atomic and shared by both poll and direct transports.
 	 *
 	 * @param string $command_id
 	 * @param string $type
@@ -93,6 +96,145 @@ class Felix_Command_Ledger {
 
 		// If insert failed due to duplicate key, the command was already recorded.
 		return false !== $inserted;
+	}
+
+	/**
+	 * Atomically reserve a command ID BEFORE any handler runs.
+	 *
+	 * This is the exactly-once gate shared by both the outbound poll runner
+	 * and the inbound direct REST endpoint. The reservation is a single
+	 * PRIMARY KEY INSERT — MySQL/MariaDB enforces atomicity, so two
+	 * concurrent reservations for the same command ID cannot both succeed.
+	 *
+	 * Possible outcomes:
+	 *   - 'reserved' : we won the race; caller MUST execute + mark_terminal().
+	 *   - 'duplicate': the command ID is already in the ledger; caller MUST
+	 *                  return the stored terminal result without re-executing.
+	 *                  record may be a non-terminal 'reserved' row if a prior
+	 *                  process crashed mid-flight — caller treats that as a
+	 *                  soft conflict and rejects.
+	 *   - 'error'    : database failure; caller rejects.
+	 *
+	 * @param string $command_id
+	 * @param string $type
+	 * @param array  $authorization_basis Optional audit trail.
+	 * @return array {status: string, record: object|null, error: string|null}
+	 */
+	public static function reserve( $command_id, $type, $authorization_basis = null ) {
+		global $wpdb;
+		$table_name = $wpdb->prefix . self::$table_name;
+
+		$auth_json = $authorization_basis ? wp_json_encode( $authorization_basis ) : null;
+
+		$inserted = $wpdb->insert(
+			$table_name,
+			array(
+				'id'                  => $command_id,
+				'type'                => $type,
+				'status'              => 'reserved',
+				'authorization_basis' => $auth_json,
+				'executed_at'         => current_time( 'mysql' ),
+			),
+			array( '%s', '%s', '%s', '%s', '%s' )
+		);
+
+		if ( false !== $inserted ) {
+			return array(
+				'status' => 'reserved',
+				'record' => null,
+				'error'  => null,
+			);
+		}
+
+		// Inspect the driver error to distinguish duplicate key from real failure.
+		$last_error = isset( $wpdb->last_error ) ? (string) $wpdb->last_error : '';
+		if ( $last_error !== '' && stripos( $last_error, 'Duplicate' ) !== false ) {
+			$row = self::get( $command_id );
+			return array(
+				'status' => 'duplicate',
+				'record' => $row,
+				'error'  => null,
+			);
+		}
+
+		return array(
+			'status' => 'error',
+			'record' => null,
+			'error'  => $last_error ?: 'unknown ledger insert failure',
+		);
+	}
+
+	/**
+	 * Update a previously-reserved row to its terminal status. Called only by
+	 * the holder that won the reservation.
+	 *
+	 * The WHERE clause pins `status = 'reserved'`, so a terminal transition is
+	 * ONLY possible from the reserved state. This makes the contract explicit
+	 * and acts as defense-in-depth: a stale mark_terminal() issued by a process
+	 * that lost the reservation race (or a row that already reached terminal)
+	 * affects zero rows and reports failure. We never overwrite a terminal row
+	 * and never steal a row we do not hold.
+	 *
+	 * @param string $command_id
+	 * @param string $status       done|failed|unconfirmed|rejected.
+	 * @param mixed  $result
+	 * @param array  $error
+	 * @param array  $processor_txn_ids
+	 * @return bool True only when the reserved→terminal transition happened.
+	 */
+	public static function mark_terminal( $command_id, $status, $result = null, $error = null, $processor_txn_ids = array() ) {
+		global $wpdb;
+		$table_name = $wpdb->prefix . self::$table_name;
+
+		$updated = $wpdb->update(
+			$table_name,
+			array(
+				'status'            => $status,
+				'result'            => $result ? wp_json_encode( $result ) : null,
+				'error'             => $error ? wp_json_encode( $error ) : null,
+				'processor_txn_ids' => ! empty( $processor_txn_ids ) ? wp_json_encode( $processor_txn_ids ) : null,
+				'executed_at'       => current_time( 'mysql' ),
+			),
+			array(
+				'id'     => $command_id,
+				'status' => 'reserved',
+			),
+			array( '%s', '%s', '%s', '%s', '%s' ),
+			array( '%s', '%s' )
+		);
+
+		// $wpdb->update() returns int|false: the number of rows affected, or
+		// false on error. The transition succeeded only when exactly the one
+		// reserved row was updated.
+		return ( false !== $updated && $updated > 0 );
+	}
+
+	/**
+	 * Convert a stored ledger row into the terminal result envelope that both
+	 * transports return to the caller. Never re-executes.
+	 *
+	 * @param object $row
+	 * @return array
+	 */
+	public static function row_to_terminal_result( $row ) {
+		return array(
+			'commandId'      => $row->id,
+			'status'         => $row->status,
+			'result'         => $row->result ? json_decode( $row->result, true ) : null,
+			'error'          => $row->error ? json_decode( $row->error, true ) : null,
+			'processorTxnIds' => $row->processor_txn_ids ? json_decode( $row->processor_txn_ids, true ) : array(),
+			'executedAt'     => $row->executed_at,
+		);
+	}
+
+	/**
+	 * Terminal (handler-executed) statuses. 'reserved' is intentionally
+	 * excluded — it means a prior process crashed mid-flight.
+	 *
+	 * @return string[]
+	 */
+	public static function terminal_statuses() {
+		return array( 'done', 'failed', 'unconfirmed', 'rejected' );
 	}
 
 	/**

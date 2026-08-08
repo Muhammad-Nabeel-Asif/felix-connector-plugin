@@ -4,7 +4,7 @@ Tags: woocommerce, customer service, ai, automation, ecommerce
 Requires at least: 6.0
 Tested up to: 6.5
 Requires PHP: 8.1
-Stable tag: 0.3.1
+Stable tag: 0.4.0
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -12,11 +12,14 @@ Connect your WooCommerce store to Felix (agentfelix.ai) for autonomous customer 
 
 == Description ==
 
-Felix is an AI-powered customer service and executive operating partner for WooCommerce brands. This connector plugin links your store to Felix so it can look up orders, manage coupons, process refunds, and handle customer inquiries — all through a secure outbound connection that works behind any firewall.
+Felix is an AI-powered customer service and executive operating partner for WooCommerce brands. This connector plugin links your store to Felix so it can look up orders, manage coupons, process refunds, and handle customer inquiries — through a secure connection that works behind any firewall.
 
 **How it works:**
 
-Your store initiates all communication to Felix — Felix never makes inbound requests to your store. This means the connector works behind any host firewall, captcha system, or security layer (SiteGround Anti-Bot, Cloudflare, Wordfence, and others).
+Felix delivers commands to your store over one of two transports, both sharing the same atomic execute-once pipeline so a command is never double-executed:
+
+1. **Outbound long-poll (default, firewall-friendly):** your store initiates all communication to Felix — Felix never makes inbound requests to your store. This means the connector works behind any host firewall, captcha system, or security layer (SiteGround Anti-Bot, Cloudflare, Wordfence, and others).
+2. **Direct command delivery (faster, optional):** when the store is reachable from Felix, Felix POSTs signed commands directly to `POST /wp-json/felix/v1/command`. This removes poll latency. Your store advertises this capability during polling; Felix uses it when available and falls back to long-poll otherwise.
 
 The connector runs automatically via WordPress's built-in scheduler (which runs whenever people visit your site) — no server configuration needed. It activates on the first page visit after pairing and continues running in the background as long as your site receives traffic.
 
@@ -33,10 +36,12 @@ Felix executes typed, validated commands only. There is no generic executor — 
 
 **Security:**
 
-* Outbound-only communication — your store's firewall is never bypassed
+* Every command is Ed25519-signed and verified before execution, on both transports
+* Shared atomic command processor — poll and direct paths reserve a command ID via a single atomic INSERT, so the same command can never run twice
+* A crashed reservation is never stolen: a command left mid-flight is reported as a conflict, not silently re-executed
+* If a command runs but its result can't be saved, it is reported as `unconfirmed` — never a false success
 * Per-command-family kill switches in plugin settings
-* Every command is Ed25519-signed and verified
-* Refunds and money-moving actions require explicit human approval
+* Refunds and money-moving actions require explicit human approval (write-authority evidence is enforced before any write handler runs)
 * Full audit log of every command executed
 
 == Installation ==
@@ -57,7 +62,7 @@ Yes. Felix can only execute specific, typed commands (look up orders, update sta
 
 = Does Felix make requests to my store? =
 
-No. Your store contacts Felix — never the other way around. This is by design: it makes the connector invisible to your host's firewall, captcha, or security layer.
+By default, no — your store contacts Felix (outbound long-poll), which keeps the connector invisible to your host's firewall, captcha, or security layer. Felix can also deliver commands directly via a signed POST to your REST API when your store is reachable; your store advertises this capability and Felix falls back to long-poll if direct delivery is unavailable. Both paths verify the same Ed25519 command signature.
 
 = How does Felix authenticate? =
 
@@ -84,6 +89,22 @@ Copy the cron command from WooCommerce → Felix Connector → Advanced & Troubl
 A scheduled task and the WordPress built-in scheduler can coexist safely — they share a lock so commands are never double-executed.
 
 == Changelog ==
+
+= 0.4.0 =
+* New: inbound direct command delivery via POST /wp-json/felix/v1/command — Felix can now push signed commands to the store directly (no longer long-poll-only)
+* New: shared atomic command processor — poll and direct transports run the identical verify → reserve → execute → persist pipeline, so a command is never double-executed across transports
+* New: deterministic atomic reservation via a single PRIMARY KEY INSERT; a redelivered command returns its stored terminal result without re-executing
+* New: "never steal a crashed reservation" — a command ID left in the reserved state by a crashed process is reported as a reservation conflict and is never silently re-executed
+* New: terminal ledger transitions are restricted to reserved → terminal; a stale or racing writer can no longer overwrite a terminal row
+* New: when a command executes but its terminal result cannot be durably persisted, the result is reported as `unconfirmed` (never a false `done`)
+* New: signed capability + version advertisement on the poll request (protocol v2: storeId/generation/timestamp + plugin version + capability list)
+* New: concrete write-authority enforcement — write command families require real approval evidence or a non-read graduated rule; the `connector-read` graduated rule is sufficient for reads but is denied for writes
+
+= 0.3.1 =
+* Fix: guest order matching in search_orders now uses the 'search' parameter with an exact email filter
+
+= 0.3.0 =
+* New: sync_orders + sync_products handlers for data-plane backfill
 
 = 0.2.0 =
 * WP-Cron is now the default scheduling mechanism — no server cron needed

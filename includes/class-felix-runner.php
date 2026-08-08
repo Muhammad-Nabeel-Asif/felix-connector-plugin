@@ -48,6 +48,9 @@ class Felix_Runner {
 	/** @var Felix_Command_Handlers */
 	private $handlers;
 
+	/** @var Felix_Command_Processor Shared pipeline (signature/auth/reservation/execute). */
+	private $processor;
+
 	/** @var string Lock file path. */
 	private $lock_file;
 
@@ -66,6 +69,7 @@ class Felix_Runner {
 	public function __construct() {
 		$this->holder_id = wp_generate_uuid4();
 		$this->handlers  = new Felix_Command_Handlers();
+		$this->processor = new Felix_Command_Processor();
 		$this->is_cli    = ( defined( 'FELIX_RUNNER_MODE' ) && FELIX_RUNNER_MODE ) || ( php_sapi_name() === 'cli' );
 
 		// Apply host profile overrides.
@@ -285,9 +289,6 @@ class Felix_Runner {
 		$generation = Felix_Pairing::get_generation();
 		$endpoint   = get_option( FELIX_OPT_POLL_ENDPOINT, FELIX_API_BASE . '/connector/poll' );
 
-		$timestamp = (string) ( time() * 1000 );
-		$sign_data = "{$store_id}\n{$generation}\n{$timestamp}";
-
 		$keypair = Felix_Pairing::get_keypair();
 		$secret  = Felix_Crypto::get_secret_key( $keypair['encryptedSecret'] );
 		if ( ! $secret ) {
@@ -295,7 +296,24 @@ class Felix_Runner {
 			return false;
 		}
 
-		$signature = Felix_Crypto::sign( $sign_data, $secret );
+		$timestamp = (string) ( time() * 1000 );
+
+		// Protocol v2 poll-auth signature. The signed string is the v1 triple
+		// (storeId\ngeneration\ntimestamp) extended with the plugin version and
+		// the advertised capability list. The X-Felix-Protocol-Version header
+		// tells the backend which signing scheme to verify, so the header and
+		// the signed string MUST stay in sync (both v2 here).
+		//
+		// Ed25519 signs exact bytes, so a backend cannot verify this signature
+		// against the v1 triple alone — protocol v2 is required on the backend
+		// side once a store advertises the directCommandV1 capability.
+		$plugin_version = defined( 'FELIX_CONNECTOR_VERSION' ) ? FELIX_CONNECTOR_VERSION : '0.0.0';
+		$capabilities   = self::capability_list();
+
+		$v1_sign_data = "{$store_id}\n{$generation}\n{$timestamp}";
+		$v2_sign_data = "{$v1_sign_data}\n{$plugin_version}\n" . implode( ',', $capabilities );
+
+		$signature_v2 = Felix_Crypto::sign( $v2_sign_data, $secret );
 		sodium_memzero( $secret );
 
 		$url = add_query_arg(
@@ -311,9 +329,14 @@ class Felix_Runner {
 			array(
 				'timeout' => $this->poll_hold_seconds + 10,
 				'headers' => array(
-					'X-Felix-Plugin-Sig'   => $signature,
+					// v1 fields — preserved verbatim for backwards compatibility.
+					'X-Felix-Plugin-Sig'   => $signature_v2,
 					'X-Felix-Plugin-KeyId' => $keypair['publicKey'],
 					'X-Felix-Timestamp'    => $timestamp,
+					// v2 additions — advertised capability + version metadata.
+					'X-Felix-Protocol-Version' => (string) FELIX_PROTOCOL_VERSION,
+					'X-Felix-Plugin-Version'   => $plugin_version,
+					'X-Felix-Capabilities'     => implode( ',', $capabilities ),
 				),
 			)
 		);
@@ -351,108 +374,36 @@ class Felix_Runner {
 			return false;
 		}
 
-		// Verify command signature.
-		$key_manifest = get_option( FELIX_OPT_KEY_MANIFEST, array() );
-		$public_key   = Felix_Crypto::lookup_key( $key_manifest, $command['keyId'] ?? '' );
+		// Delegate to the shared processor. The poll path then posts the
+		// terminal result back to Felix — direct REST path does not.
+		$terminal = $this->processor->process( $raw_body, $command );
 
-		if ( ! $public_key ) {
-			$this->log( 'Unknown keyId: ' . ( $command['keyId'] ?? '' ) );
-			$this->post_result( $command['commandId'], 'rejected', null, array( 'code' => 'unknown_key', 'message' => 'Signing key not found' ) );
-			return false;
+		if ( 'rejected' === $terminal['status'] || 'failed' === $terminal['status'] ) {
+			$this->log( sprintf( 'Command %s → %s (%s)', $command['commandId'], $terminal['status'], $terminal['error']['code'] ?? 'unknown' ) );
+		} else {
+			$this->log( sprintf( 'Command %s → %s%s', $command['commandId'], $terminal['status'], ! empty( $terminal['alreadyExecuted'] ) ? ' (redelivered)' : '' ) );
 		}
-
-		$sig_valid = Felix_Crypto::verify_command_signature(
-			$raw_body,
-			$command['signature'] ?? '',
-			$public_key
-		);
-
-		if ( ! $sig_valid ) {
-			$this->log( 'Invalid command signature.' );
-			$this->post_result( $command['commandId'], 'rejected', null, array( 'code' => 'signature_invalid', 'message' => 'Signature verification failed' ) );
-			return false;
-		}
-
-		// Validate envelope.
-		if ( ! $this->validate_command( $command ) ) {
-			return false;
-		}
-
-		// Check dedup ledger.
-		$existing = Felix_Command_Ledger::get( $command['commandId'] );
-		if ( $existing && in_array( $existing->status, array( 'done', 'failed', 'unconfirmed', 'rejected' ), true ) ) {
-			$this->post_result(
-				$command['commandId'],
-				$existing->status,
-				$existing->result ? json_decode( $existing->result, true ) : null,
-				$existing->error ? json_decode( $existing->error, true ) : null
-			);
-			return true;
-		}
-
-		// Nonce check.
-		if ( ! Felix_Command_Ledger::check_nonce( $command['nonce'] ?? '' ) ) {
-			$this->post_result( $command['commandId'], 'rejected', null, array( 'code' => 'nonce_seen', 'message' => 'Nonce already consumed' ) );
-			return false;
-		}
-
-		// Execute.
-		$this->log( sprintf( 'Executing %s (%s)', $command['type'], $command['commandId'] ) );
-
-		$result = $this->handlers->execute(
-			$command['commandId'],
-			$command['type'],
-			$command['args'] ?? array(),
-			$command['authorizationBasis'] ?? null
-		);
-
-		Felix_Command_Ledger::record(
-			$command['commandId'],
-			$command['type'],
-			$result['status'],
-			$result['result'] ?? null,
-			$result['error'] ?? null,
-			$result['processorTxnIds'] ?? array(),
-			$command['authorizationBasis'] ?? null
-		);
 
 		$this->post_result(
 			$command['commandId'],
-			$result['status'],
-			$result['result'] ?? null,
-			$result['error'] ?? null,
-			$result['processorTxnIds'] ?? array()
+			$terminal['status'],
+			$terminal['result'],
+			$terminal['error'],
+			$terminal['processorTxnIds']
 		);
 
-		$this->log( sprintf( 'Command %s → %s', $command['commandId'], $result['status'] ) );
 		return true;
 	}
 
 	/**
-	 * Validate a command envelope.
+	 * Capability list advertised to the backend. Kept as a static method so
+	 * the REST layer and pairing environment can reuse the same source of
+	 * truth.
 	 *
-	 * @param array $command
-	 * @return bool
+	 * @return string[]
 	 */
-	private function validate_command( $command ) {
-		if ( ( $command['storeId'] ?? '' ) !== Felix_Pairing::get_store_id() ) {
-			$this->post_result( $command['commandId'], 'rejected', null, array( 'code' => 'store_mismatch', 'message' => 'Store ID mismatch' ) );
-			return false;
-		}
-
-		if ( (int) ( $command['generation'] ?? 0 ) !== Felix_Pairing::get_generation() ) {
-			$this->post_result( $command['commandId'], 'rejected', null, array( 'code' => 'generation_mismatch', 'message' => 'Generation mismatch' ) );
-			return false;
-		}
-
-		$issued_at = strtotime( $command['issuedAt'] ?? '' );
-		$ttl       = $command['ttlSeconds'] ?? 120;
-		if ( $issued_at === false || ( time() - $issued_at ) > $ttl ) {
-			$this->post_result( $command['commandId'], 'rejected', null, array( 'code' => 'ttl_expired', 'message' => 'TTL expired' ) );
-			return false;
-		}
-
-		return true;
+	public static function capability_list() {
+		return array( 'directCommandV1' );
 	}
 
 	/**

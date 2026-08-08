@@ -72,6 +72,22 @@ class Felix_Command_Handlers {
 	);
 
 	/**
+	 * Read-only families. Every other family in the map is treated as a
+	 * write family for authorization-basis enforcement.
+	 *
+	 * @var string[]
+	 */
+	private static $read_families = array(
+		'system',
+		'order_read',
+		'product_read',
+		'subscription_read',
+		'coupon_read',
+		'customer_read',
+		'sync',
+	);
+
+	/**
 	 * Initialize handlers.
 	 */
 	public function __construct() {
@@ -117,6 +133,11 @@ class Felix_Command_Handlers {
 	/**
 	 * Execute a command.
 	 *
+	 * Authorization-basis enforcement happens BEFORE the handler is invoked.
+	 * The synthetic connector-read graduated rule is sufficient for read
+	 * families but is explicitly denied for any write family; writes require
+	 * real approval evidence or a non-read graduated rule.
+	 *
 	 * @param string $command_id
 	 * @param string $type
 	 * @param array  $args
@@ -147,7 +168,19 @@ class Felix_Command_Handlers {
 			);
 		}
 
-		// 3. Execute the handler.
+		// 3. Authorize the basis against the family's read/write classification.
+		$auth = self::authorize( $family, $authorization_basis );
+		if ( ! $auth['ok'] ) {
+			return array(
+				'status' => 'rejected',
+				'error'  => array(
+					'code'    => $auth['code'],
+					'message' => $auth['message'],
+				),
+			);
+		}
+
+		// 4. Execute the handler.
 		try {
 			$result = call_user_func( $this->handlers[ $type ], $args, $command_id );
 
@@ -173,6 +206,96 @@ class Felix_Command_Handlers {
 				),
 			);
 		}
+	}
+
+	/**
+	 * Public family lookup — used by the shared processor for authorization.
+	 *
+	 * @param string $type
+	 * @return string|null
+	 */
+	public static function family_for( $type ) {
+		return self::$family_map[ $type ] ?? null;
+	}
+
+	/**
+	 * Whether a family is in the explicit read allowlist.
+	 *
+	 * @param string $family
+	 * @return bool
+	 */
+	public static function is_read_family( $family ) {
+		return in_array( $family, self::$read_families, true );
+	}
+
+	/**
+	 * Authorize an authorization basis against a command family.
+	 *
+	 * Policy:
+	 *  - Deny-by-default. Missing/non-array basis or unknown kind rejects.
+	 *  - Approval evidence satisfies both reads and writes.
+	 *  - Graduated rule 'connector-read' satisfies reads, denies writes.
+	 *  - Any other graduated rule satisfies both reads and writes.
+	 *
+	 * @param string $family
+	 * @param mixed  $authorization_basis
+	 * @return array {ok: bool, code?: string, message?: string}
+	 */
+	public static function authorize( $family, $authorization_basis ) {
+		if ( ! is_array( $authorization_basis ) ) {
+			return array(
+				'ok'      => false,
+				'code'    => 'missing_authorization',
+				'message' => 'Authorization basis required',
+			);
+		}
+
+		$kind    = $authorization_basis['kind'] ?? null;
+		$rule_id = $authorization_basis['ruleId'] ?? null;
+
+		if ( ! $kind ) {
+			return array(
+				'ok'      => false,
+				'code'    => 'missing_authorization_kind',
+				'message' => 'Authorization basis kind required',
+			);
+		}
+
+		$is_read = self::is_read_family( $family );
+
+		if ( 'approval' === $kind ) {
+			return array( 'ok' => true );
+		}
+
+		if ( 'graduated_rule' === $kind ) {
+			if ( ! $rule_id ) {
+				return array(
+					'ok'      => false,
+					'code'    => 'missing_rule_id',
+					'message' => 'graduated_rule authorization requires ruleId',
+				);
+			}
+
+			if ( 'connector-read' === $rule_id ) {
+				if ( $is_read ) {
+					return array( 'ok' => true );
+				}
+				return array(
+					'ok'      => false,
+					'code'    => 'insufficient_authorization',
+					'message' => 'connector-read authority is not sufficient for write commands',
+				);
+			}
+
+			// Any other graduated rule satisfies both reads and writes.
+			return array( 'ok' => true );
+		}
+
+		return array(
+			'ok'      => false,
+			'code'    => 'unknown_authorization_kind',
+			'message' => sprintf( 'Unknown authorization kind: %s', $kind ),
+		);
 	}
 
 	/**
