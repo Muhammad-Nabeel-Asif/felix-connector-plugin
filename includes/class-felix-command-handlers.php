@@ -83,8 +83,14 @@ class Felix_Command_Handlers {
 			'get_order'     => array( $this, 'handle_get_order' ),
 			'search_orders' => array( $this, 'handle_search_orders' ),
 
+			// Sync (paged backfill for the data mirror)
+			'sync_orders'   => array( $this, 'handle_sync_orders' ),
+
 			// Product reads
 			'list_products' => array( $this, 'handle_list_products' ),
+
+			// Sync (paged product backfill)
+			'sync_products' => array( $this, 'handle_sync_products' ),
 
 			// Customer reads
 			'list_customers' => array( $this, 'handle_list_customers' ),
@@ -329,6 +335,85 @@ class Felix_Command_Handlers {
 
 		if ( isset( $args['search'] ) ) {
 			$query_args['s'] = $args['search'];
+		}
+
+		$products = wc_get_products( $query_args );
+
+		$serialized = array();
+		foreach ( $products as $product ) {
+			$serialized[] = $this->serialize_product( $product );
+		}
+
+		return array(
+			'result' => array( 'products' => $serialized ),
+		);
+	}
+
+	// ------------------------------------------------------------------------
+	// Handlers — Sync (paged backfill for the data mirror)
+	// -------------------------------------------------------------------------
+
+	/**
+	 * Handler: sync_orders — paged order backfill by modified_after cursor.
+	 *
+	 * Used by WooCommerceSyncConnector to fill the data mirror via the
+	 * connector protocol. Supports date-cursor pagination: the engine sends
+	 * modifiedAfter (ISO 8601) + limit + page; this handler returns one page
+	 * of orders modified after that timestamp, ordered ascending.
+	 */
+	private function handle_sync_orders( $args, $command_id ) {
+		$this->require_woocommerce();
+
+		$modified_after = $args['modifiedAfter'] ?? $args['modified_after'] ?? null;
+		$limit          = min( intval( $args['limit'] ?? 100 ), 100 );
+		$page           = max( intval( $args['page'] ?? 1 ), 1 );
+
+		$query_args = array(
+			'limit'    => $limit,
+			'page'     => $page,
+			'orderby'  => 'modified',
+			'order'    => 'ASC',
+			'type'     => 'shop_order',
+			'return'   => 'objects',
+		);
+
+		if ( $modified_after ) {
+			$query_args['date_modified'] = '>=' . $modified_after;
+		}
+
+		$orders = wc_get_orders( $query_args );
+
+		$serialized = array();
+		foreach ( $orders as $order ) {
+			$serialized[] = $this->serialize_order( $order );
+		}
+
+		return array(
+			'result' => array( 'orders' => $serialized ),
+		);
+	}
+
+	/**
+	 * Handler: sync_products — paged product backfill by modified_after cursor.
+	 */
+	private function handle_sync_products( $args, $command_id ) {
+		$this->require_woocommerce();
+
+		$modified_after = $args['modifiedAfter'] ?? $args['modified_after'] ?? null;
+		$limit          = min( intval( $args['limit'] ?? 50 ), 100 );
+		$page           = max( intval( $args['page'] ?? 1 ), 1 );
+
+		$query_args = array(
+			'limit'   => $limit,
+			'page'    => $page,
+			'orderby' => 'modified',
+			'order'   => 'ASC',
+			'status'  => 'any',
+			'return'  => 'objects',
+		);
+
+		if ( $modified_after ) {
+			$query_args['modified'] = '>=' . $modified_after;
 		}
 
 		$products = wc_get_products( $query_args );
