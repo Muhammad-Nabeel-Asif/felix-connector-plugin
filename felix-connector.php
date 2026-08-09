@@ -200,24 +200,44 @@ function felix_connector_watchdog() {
 	$stale_threshold = $cron_interval + 120; // One cron window + margin.
 
 	if ( $stale_seconds > $stale_threshold ) {
-		// Report staleness to Felix (best-effort, fire-and-forget).
-		$store_id = get_option( FELIX_OPT_STORE_ID );
+		// Report staleness to Felix (best-effort, fire-and-forget). SIGNED per
+		// the v2 raw-body contract so the backend authenticates the heartbeat:
+		// the signature binds `timestamp\nrawBody`, and the keyId/timestamp/
+		// protocol headers are sent so the backend can verify + enforce
+		// freshness. An unsigned heartbeat is rejected (401) by the backend.
+		$store_id   = get_option( FELIX_OPT_STORE_ID );
 		$generation = get_option( FELIX_OPT_GENERATION, 1 );
 
 		if ( $store_id ) {
+			$body = array(
+				'protocolVersion' => FELIX_PROTOCOL_VERSION,
+				'storeId'         => $store_id,
+				'generation'      => $generation,
+				'staleSeconds'    => $stale_seconds,
+				'source'          => 'wp_cron_watchdog',
+			);
+			$body_json = wp_json_encode( $body );
+
+			$headers = array( 'Content-Type' => 'application/json' );
+			$keypair = Felix_Pairing::get_keypair();
+			if ( $keypair && isset( $keypair['encryptedSecret'] ) ) {
+				$secret = Felix_Crypto::get_secret_key( $keypair['encryptedSecret'] );
+				if ( $secret ) {
+					$timestamp = (string) ( time() * 1000 );
+					$sig       = Felix_Crypto::sign( $timestamp . "\n" . $body_json, $secret );
+					$headers['X-Felix-Plugin-Sig']       = $sig;
+					$headers['X-Felix-Plugin-KeyId']     = $keypair['publicKey'];
+					$headers['X-Felix-Timestamp']        = $timestamp;
+					$headers['X-Felix-Protocol-Version'] = (string) FELIX_PROTOCOL_VERSION;
+					sodium_memzero( $secret );
+				}
+			}
+
 			wp_remote_post(
 				FELIX_API_BASE . '/connector/heartbeat',
 				array(
-					'headers' => array( 'Content-Type' => 'application/json' ),
-					'body'    => wp_json_encode(
-						array(
-							'protocolVersion' => FELIX_PROTOCOL_VERSION,
-							'storeId'         => $store_id,
-							'generation'      => $generation,
-							'staleSeconds'    => $stale_seconds,
-							'source'          => 'wp_cron_watchdog',
-						)
-					),
+					'headers' => $headers,
+					'body'    => $body_json,
 					'timeout' => 10,
 				)
 			);

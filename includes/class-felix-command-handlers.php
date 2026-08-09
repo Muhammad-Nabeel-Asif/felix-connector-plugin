@@ -127,6 +127,7 @@ class Felix_Command_Handlers {
 
 			// Subscription writes
 			'update_subscription_status' => array( $this, 'handle_update_subscription_status' ),
+			'renew_subscription'         => array( $this, 'handle_renew_subscription' ),
 		);
 	}
 
@@ -951,6 +952,49 @@ class Felix_Command_Handlers {
 		return array(
 			'result' => array(
 				'subscription' => $this->serialize_subscription( $subscription ),
+			),
+		);
+	}
+
+	/**
+	 * Handler: renew_subscription — create a manual renewal order for the
+	 * subscription via WooCommerce Subscriptions (wcs_create_renewal_order).
+	 *
+	 * HONEST SEMANTICS: WooCommerce has no first-class instant-charge endpoint.
+	 * This creates the renewal order (the store's Action Scheduler processes
+	 * the real charge on its next tick). The serialized subscription + the new
+	 * renewal order id are returned so the caller can report the scheduled
+	 * (not instant) renewal honestly.
+	 *
+	 * Requires the WooCommerce Subscriptions plugin + the wcs_create_renewal_order
+	 * function. If the capability is unavailable, fails honestly (no fake charge).
+	 */
+	private function handle_renew_subscription( $args, $command_id ) {
+		$this->require_subscriptions();
+
+		$sub_id = $args['subscriptionId'] ?? null;
+		if ( ! $sub_id ) {
+			throw new Exception( 'renew_subscription requires subscriptionId' );
+		}
+
+		$subscription = wcs_get_subscription( $sub_id );
+		if ( ! $subscription ) {
+			throw new Exception( sprintf( 'Subscription %s not found', $sub_id ) );
+		}
+
+		if ( ! function_exists( 'wcs_create_renewal_order' ) ) {
+			throw new Exception( 'WooCommerce Subscriptions renewal is not available on this store' );
+		}
+
+		$renewal_order = wcs_create_renewal_order( $subscription );
+		if ( ! $renewal_order ) {
+			throw new Exception( sprintf( 'Failed to create renewal order for subscription %s', $sub_id ) );
+		}
+
+		return array(
+			'result' => array(
+				'subscription'    => $this->serialize_subscription( $subscription ),
+				'renewalOrderId'  => $renewal_order->get_id(),
 			),
 		);
 	}

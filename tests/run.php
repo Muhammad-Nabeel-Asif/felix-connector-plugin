@@ -114,11 +114,12 @@ function make_envelope( $overrides = array() ) {
 
 /**
  * Build (raw_body, envelope) with a valid Ed25519 signature over the
- * signature-less canonical form.
+ * signature-less CANONICAL form (recursively sorted keys + wp_json_encode
+ * escaping). This matches the backend's canonicalCommandJson() byte contract.
  */
 function sign_envelope( $envelope, $secret ) {
 	unset( $envelope['signature'] );
-	$canonical            = wp_json_encode( $envelope );
+	$canonical            = Felix_Crypto::canonical_json( $envelope );
 	$envelope['signature'] = Felix_Crypto::sign( $canonical, $secret );
 	return array( wp_json_encode( $envelope ), $envelope );
 }
@@ -450,6 +451,202 @@ function test_poll_capability_advertised() {
 	expect_eq( 'protocol version is 2 (v2 signature)', FELIX_PROTOCOL_VERSION, 2 );
 }
 
+// =============================================================================
+// COLD-AUDIT REMEDIATION TESTS
+// =============================================================================
+
+/**
+ * #4 — recursive canonical JSON byte contract (slash + unicode + sorted keys).
+ * The plugin's canonical_json MUST produce bytes identical to the backend's
+ * canonicalCommandJson() so Ed25519 signatures verify cross-language.
+ */
+function test_canonical_json_contract() {
+	echo "\n[canonical JSON contract (#4)]\n";
+
+	// Sorted keys + slash escaping + unicode escaping.
+	$out = Felix_Crypto::canonical_json(
+		array(
+			'b'    => 1,
+			'a'    => 'https://shop.example.com',
+			'name' => 'José',
+		)
+	);
+	expect( 'keys sorted ascending (a before b before name)', strpos( $out, '"a"' ) < strpos( $out, '"b"' ) && strpos( $out, '"b"' ) < strpos( $out, '"name"' ) );
+	expect( 'forward slashes escaped (\/)', false !== strpos( $out, 'https:\/\/shop.example.com' ) );
+	expect( 'non-ASCII escaped (\\u00e9)', false !== strpos( $out, 'Jos\u00e9' ) );
+
+	// Exact byte-for-byte match for a reordered object.
+	$got = Felix_Crypto::canonical_json( array( 'z' => 1, 'a' => 2 ) );
+	expect_eq( 'reordered {z,a} canonicalizes to {"a":2,"z":1}', $got, '{"a":2,"z":1}' );
+
+	// Nested object keys sorted recursively.
+	$nested = Felix_Crypto::canonical_json( array( 'outer' => array( 'z' => 1, 'a' => 2 ) ) );
+	expect( 'nested keys sorted', false !== strpos( $nested, '{"a":2,"z":1}' ) );
+
+	// Arrays preserve element order (NOT sorted).
+	$arr = Felix_Crypto::canonical_json( array( 'list' => array( 3, 1, 2 ) ) );
+	expect_eq( 'array order preserved', $arr, '{"list":[3,1,2]}' );
+}
+
+/**
+ * #4 — a signed envelope with a URL + non-ASCII args verifies after the wire
+ * re-serialization (the real cross-language path: backend signs canonical, the
+ * raw body carries whatever order, plugin re-canonicalizes + verifies).
+ */
+function test_signature_with_url_and_unicode() {
+	echo "\n[signature survives URL slash + unicode args (#4)]\n";
+	reset_state();
+	$secret = make_backend_key();
+	$proc   = new Felix_Command_Processor();
+
+	$env = make_envelope(
+		array(
+			'args' => array(
+				'storeUrl' => 'https://shop.example.com/path',
+				'customer' => 'José Müller',
+			),
+		)
+	);
+	list( $raw ) = sign_envelope( $env, $secret );
+	// Simulate the wire re-serializing the body in a DIFFERENT key order (as a
+	// real HTTP layer might): decode, shuffle a key to the end, re-encode. The
+	// signature must still verify because canonical_json sorts keys.
+	$shuffled         = json_decode( $raw, true );
+	$args             = $shuffled['args'];
+	$customer         = $args['customer'];
+	unset( $args['customer'] );
+	$args['customer'] = $customer;
+	$shuffled['args'] = $args;
+	$rewired          = wp_json_encode( $shuffled );
+
+	$t = $proc->process( $rewired, json_decode( $rewired, true ) );
+	expect_eq( 'URL+unicode envelope with reordered args verifies + executes', $t['status'], 'done' );
+}
+
+/**
+ * #3 — a stale (crashed) reservation is reconciled to honest `unconfirmed` on
+ * the next redelivery, not an indefinite reservation_conflict loop.
+ */
+function test_stale_reservation_reconciled() {
+	echo "\n[stale reservation reconciled to unconfirmed (#3)]\n";
+	reset_state();
+	$secret = make_backend_key();
+	$proc   = new Felix_Command_Processor();
+
+	// Seed a STALE reserved row (created 10 min ago → beyond the 120s lease).
+	$env = make_envelope();
+	$GLOBALS['wpdb']->seed_row(
+		LEDGER_TABLE,
+		array(
+			'id'          => $env['commandId'],
+			'type'        => 'ping',
+			'status'      => 'reserved',
+			'executed_at' => current_time( 'mysql' ),
+			'created_at'  => gmdate( 'Y-m-d H:i:s', time() - 600 ),
+		)
+	);
+
+	list( $raw ) = sign_envelope( $env, $secret );
+	$before      = $GLOBALS['__felix_handler_calls'];
+	$t           = $proc->process( $raw, json_decode( $raw, true ) );
+
+	// The stale reservation is reconciled to unconfirmed (honest terminal),
+	// returned as an already-executed idempotent result. The handler must NOT
+	// re-run (the prior execution's outcome is unknown).
+	expect_eq( 'stale reservation => unconfirmed (honest)', $t['status'], 'unconfirmed' );
+	expect( 'stale reservation did not re-run handler', $GLOBALS['__felix_handler_calls'] === $before );
+
+	// The row is now unconfirmed in the ledger.
+	$row = Felix_Command_Ledger::get( $env['commandId'] );
+	expect_eq( 'ledger row reconciled to unconfirmed', $row->status, 'unconfirmed' );
+
+	// A SECOND redelivery returns the stored unconfirmed (idempotent).
+	$t2 = $proc->process( $raw, json_decode( $raw, true ) );
+	expect_eq( 'second redelivery returns stored unconfirmed', $t2['status'], 'unconfirmed' );
+}
+
+/**
+ * #3 — a FRESH reservation (still in-flight) is NOT reconciled; it stays a
+ * reservation_conflict (the crash heuristic must not steal a live claimant).
+ */
+function test_fresh_reservation_not_reconciled() {
+	echo "\n[fresh reservation stays conflict (#3)]\n";
+	reset_state();
+	$secret = make_backend_key();
+	$proc   = new Felix_Command_Processor();
+
+	$env = make_envelope();
+	$GLOBALS['wpdb']->seed_row(
+		LEDGER_TABLE,
+		array(
+			'id'          => $env['commandId'],
+			'type'        => 'ping',
+			'status'      => 'reserved',
+			'executed_at' => current_time( 'mysql' ),
+			'created_at'  => gmdate( 'Y-m-d H:i:s', time() - 5 ), // 5s ago — fresh
+		)
+	);
+
+	list( $raw ) = sign_envelope( $env, $secret );
+	$t           = $proc->process( $raw, json_decode( $raw, true ) );
+	expect_eq( 'fresh reservation => reservation_conflict', $t['error']['code'], 'reservation_conflict' );
+	$row = Felix_Command_Ledger::get( $env['commandId'] );
+	expect_eq( 'fresh reservation row left as reserved', $row->status, 'reserved' );
+}
+
+/**
+ * #6 — enumeration completeness: renew_subscription has a family AND a handler
+ * (the gap was: family_map named it, the adapter called it, but no handler was
+ * registered → unknown_type). Also asserts every produced type has a family.
+ */
+function test_renew_handler_registered() {
+	echo "\n[renew_subscription handler + family consistency (#6)]\n";
+
+	// family_map includes renew_subscription.
+	expect_eq( 'renew_subscription family is subscription_write', Felix_Command_Handlers::family_for( 'renew_subscription' ), 'subscription_write' );
+
+	// A handler IS registered (execute does NOT return unknown_type).
+	$h = new Felix_Command_Handlers();
+	$r = $h->execute( 'cmd-x', 'renew_subscription', array( 'subscriptionId' => 1 ) );
+	expect( 'renew_subscription has a handler (not unknown_type)', ! ( 'rejected' === $r['status'] && 'unknown_type' === $r['error']['code'] ) );
+
+	// Every connector-produced type resolves to a family (deny/default for unknown).
+	$produced = array(
+		'ping', 'get_order', 'search_orders', 'sync_orders', 'sync_products',
+		'list_products', 'get_subscription', 'list_subscriptions', 'list_subscriptions_for_customer',
+		'list_customers', 'update_order_status', 'update_order_shipping_address',
+		'create_coupon', 'update_coupon', 'deactivate_coupon',
+		'update_subscription_status', 'renew_subscription',
+	);
+	$missing = array();
+	foreach ( $produced as $type ) {
+		if ( null === Felix_Command_Handlers::family_for( $type ) ) {
+			$missing[] = $type;
+		}
+	}
+	expect( 'every produced command type has a family', empty( $missing ) );
+
+	// Unknown type stays deny/default.
+	expect( 'unknown type has no family (deny)', null === Felix_Command_Handlers::family_for( 'totally_made_up' ) );
+}
+
+/**
+ * #1 — authorization_basis is accepted as an OBJECT (the backend now stores it
+ * as ::jsonb, not a JSON string). The handler authorize() must accept the
+ * object form and not reject it.
+ */
+function test_authorization_basis_object_form() {
+	echo "\n[authorization_basis object form accepted (#1)]\n";
+	// approval object → write allowed.
+	$r = Felix_Command_Handlers::authorize( 'subscription_write', array( 'kind' => 'approval', 'evidenceRef' => 'human_approved' ) );
+	expect( 'approval basis object accepted for write', $r['ok'] );
+
+	// A JSON STRING (the old backend bug shape) must be rejected — proving the
+	// plugin fails closed on the string form so the ::jsonb fix is required.
+	$r2 = Felix_Command_Handlers::authorize( 'subscription_write', '{"kind":"approval"}' );
+	expect( 'string authorization_basis rejected (proves #1 contract)', ! $r2['ok'] );
+}
+
 // The runner class is only loaded via felix-connector.php (not in the test
 // bootstrap), but capability_list is referenced statically. Load it safely.
 if ( ! class_exists( 'Felix_Runner' ) ) {
@@ -473,6 +670,12 @@ test_unconfirmed_on_persistence_failure();
 test_nonce_replay();
 test_rest_endpoint();
 test_poll_capability_advertised();
+test_canonical_json_contract();
+test_signature_with_url_and_unicode();
+test_stale_reservation_reconciled();
+test_fresh_reservation_not_reconciled();
+test_renew_handler_registered();
+test_authorization_basis_object_form();
 
 echo str_repeat( '=', 60 ) . "\n";
 $total = $GLOBALS['__pass'] + $GLOBALS['__fail'];

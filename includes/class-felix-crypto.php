@@ -115,9 +115,17 @@ class Felix_Crypto {
 	/**
 	 * Verify a command envelope's signature.
 	 *
-	 * The signature is computed over the JSON with the "signature" field
-	 * REMOVED (not zeroed). We parse the body, strip the field, re-serialize
-	 * with the same flags both sides use, and verify.
+	 * The signature is computed over the EXPLICIT recursive canonical JSON form
+	 * (object keys sorted ascending, production wp_json_encode escaping: slashes
+	 * escaped as \/, non-ASCII as \uXXXX) with the "signature" field REMOVED.
+	 *
+	 * This is the cross-language byte contract: the backend signs
+	 * canonicalCommandJson() (Node) which sorts keys + escapes slashes/unicode
+	 * to match wp_json_encode; the plugin reproduces the IDENTICAL bytes here by
+	 * recursively ksort-ing the decoded structure then wp_json_encode-ing it.
+	 * Signing raw JSON.stringify / wp_json_encode output (unsorted, or with
+	 * differing slash/unicode escaping) would break verification whenever args
+	 * contain a URL (slash) or non-ASCII text.
 	 *
 	 * @param string $raw_body      The raw HTTP response body.
 	 * @param string $signature_b64  The signature value from the JSON.
@@ -133,14 +141,62 @@ class Felix_Crypto {
 		// Remove the signature field.
 		unset( $parsed['signature'] );
 
-		// Canonical: sorted keys, unescaped slashes, no spaces.
-		// PHP_JSON_THROW_ON_ERROR would be ideal but requires PHP 7.3+.
-		$canonical = wp_json_encode( $parsed );
+		// Canonical: recursively sorted object keys + wp_json_encode escaping
+		// (slashes + unicode). MUST match the backend's canonicalCommandJson().
+		$canonical = self::canonical_json( $parsed );
 		if ( false === $canonical ) {
 			return false;
 		}
 
 		return self::verify( $canonical, $signature_b64, $public_key_b64 );
+	}
+
+	/**
+	 * Produce the recursive canonical JSON string for a value: object keys
+	 * sorted ascending (SORT_STRING), arrays preserved in order, using
+	 * wp_json_encode escaping (slashes → \/, non-ASCII → \uXXXX). This is the
+	 * exact byte contract the backend's canonicalCommandJson() reproduces.
+	 *
+	 * @param mixed $data
+	 * @return string|false
+	 */
+	public static function canonical_json( $data ) {
+		return wp_json_encode( self::canonicalize( $data ) );
+	}
+
+	/**
+	 * Recursively sort object keys of a decoded JSON structure. A JSON object
+	 * (associative array) is ksort-ed; a JSON array (0-indexed) preserves order.
+	 * Empty arrays are left as-is (wp_json_encode renders them as []).
+	 *
+	 * @param mixed $data
+	 * @return mixed
+	 */
+	private static function canonicalize( $data ) {
+		if ( ! is_array( $data ) ) {
+			return $data;
+		}
+		if ( self::is_assoc_array( $data ) ) {
+			ksort( $data, SORT_STRING );
+		}
+		foreach ( $data as $k => $v ) {
+			$data[ $k ] = self::canonicalize( $v );
+		}
+		return $data;
+	}
+
+	/**
+	 * True when $arr is an associative array (at least one non-sequential
+	 * string key), i.e. a decoded JSON OBJECT (vs a JSON array).
+	 *
+	 * @param array $arr
+	 * @return bool
+	 */
+	private static function is_assoc_array( $arr ) {
+		if ( empty( $arr ) ) {
+			return true; // empty → treated as object {} by canonical contract.
+		}
+		return array_keys( $arr ) !== range( 0, count( $arr ) - 1 );
 	}
 
 	/**

@@ -440,10 +440,17 @@ class Felix_Runner {
 		$headers = array( 'Content-Type' => 'application/json' );
 
 		if ( $secret ) {
-			$sig                              = Felix_Crypto::sign( $body_json, $secret );
-			$headers['X-Felix-Plugin-Sig']    = $sig;
-			$headers['X-Felix-Plugin-KeyId']  = $keypair['publicKey'];
-			$headers['X-Felix-Timestamp']     = (string) ( time() * 1000 );
+			$timestamp = (string) ( time() * 1000 );
+			// Protocol v2 ANTI-REPLAY: sign `timestamp\nrawBody` so the timestamp
+			// is BOUND into the signature (a captured body cannot be replayed
+			// with a fresh timestamp header). The backend reconstructs the same
+			// `timestamp\nrawBody` for v2 verification.
+			$sign_data = $timestamp . "\n" . $body_json;
+			$sig       = Felix_Crypto::sign( $sign_data, $secret );
+			$headers['X-Felix-Plugin-Sig']      = $sig;
+			$headers['X-Felix-Plugin-KeyId']    = $keypair['publicKey'];
+			$headers['X-Felix-Timestamp']       = $timestamp;
+			$headers['X-Felix-Protocol-Version'] = (string) FELIX_PROTOCOL_VERSION;
 			sodium_memzero( $secret );
 		}
 

@@ -70,8 +70,15 @@ function delete_option( $key ) {
 	return true;
 }
 
+/**
+ * wp_json_encode shim — MUST match production WordPress behavior: json_encode
+ * with DEFAULT flags (escapes forward slashes as \/ and non-ASCII as \uXXXX).
+ * The canonical JSON signature contract (#4) depends on this exact escaping;
+ * a test-only JSON_UNESCAPED_SLASHES|JSON_UNESCAPED_UNICODE override would mask
+ * the real cross-language byte contract and let a signature bug pass tests.
+ */
 function wp_json_encode( $data, $options = 0, $depth = 512 ) {
-	return json_encode( $data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | (int) $options, $depth );
+	return json_encode( $data, (int) $options, $depth );
 }
 
 function wp_salt( $scheme = 'auth' ) {

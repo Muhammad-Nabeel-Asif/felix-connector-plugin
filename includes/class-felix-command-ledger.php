@@ -17,6 +17,19 @@ class Felix_Command_Ledger {
 	private static $table_name = 'felix_connector_commands';
 
 	/**
+	 * Reservation lease (seconds). A `reserved` row older than this is
+	 * considered CRASHED (the process that reserved it never reached a terminal
+	 * state). On the next redelivery, a stale reservation is reconciled to an
+	 * honest `unconfirmed` outcome so the same command id stops blocking
+	 * redelivery (the backend requeues/retries, and the next redelivery returns
+	 * the stored unconfirmed terminal). Sized relative to the backend's
+	 * ~120s command TTL: a reservation older than 120s has almost certainly
+	 * been abandoned (plugin executions are seconds), and the backend will have
+	 * begun requeuing redeliveries by then.
+	 */
+	const RESERVATION_LEASE_SECONDS = 120;
+
+	/**
 	 * Create the ledger table on activation.
 	 */
 	public static function create_table() {
@@ -150,6 +163,20 @@ class Felix_Command_Ledger {
 		$last_error = isset( $wpdb->last_error ) ? (string) $wpdb->last_error : '';
 		if ( $last_error !== '' && stripos( $last_error, 'Duplicate' ) !== false ) {
 			$row = self::get( $command_id );
+
+			// STALE-RESERVATION RECONCILIATION (#3): a `reserved` row whose lease
+			// has elapsed was abandoned by a crashed process. Reconcile it to an
+			// honest `unconfirmed` outcome so the next redelivery returns a
+			// truthful terminal instead of looping reservation_conflict until
+			// the 30-day prune (the backend TTL is ~120s; a reservation older
+			// than the lease has almost certainly been abandoned). A FRESH
+			// reservation stays a soft conflict (returned as-is; the processor
+			// rejects with reservation_conflict so the backend retries).
+			if ( $row && 'reserved' === $row->status && self::is_reservation_stale( $row ) ) {
+				self::reconcile_stale_reservation( $row );
+				$row = self::get( $command_id );
+			}
+
 			return array(
 				'status' => 'duplicate',
 				'record' => $row,
@@ -161,6 +188,59 @@ class Felix_Command_Ledger {
 			'status' => 'error',
 			'record' => null,
 			'error'  => $last_error ?: 'unknown ledger insert failure',
+		);
+	}
+
+	/**
+	 * True when a `reserved` ledger row is older than the reservation lease
+	 * (the reserving process crashed before reaching a terminal state).
+	 *
+	 * @param object $row
+	 * @return bool
+	 */
+	public static function is_reservation_stale( $row ) {
+		if ( ! isset( $row->created_at ) ) {
+			return false;
+		}
+		$created = strtotime( $row->created_at );
+		if ( false === $created ) {
+			return false;
+		}
+		return ( time() - $created ) > self::RESERVATION_LEASE_SECONDS;
+	}
+
+	/**
+	 * Reconcile a stale `reserved` row to an honest `unconfirmed` terminal.
+	 * The side-effecting handler already ran (or not) but the ledger never
+	 * recorded the outcome — surfacing `unconfirmed` lets the backend
+	 * reconcile/retry instead of trusting an unknown state. Pinned to
+	 * status='reserved' so a row that already reached terminal is untouched.
+	 *
+	 * @param object $row
+	 * @return void
+	 */
+	public static function reconcile_stale_reservation( $row ) {
+		global $wpdb;
+		$table_name = $wpdb->prefix . self::$table_name;
+
+		$wpdb->update(
+			$table_name,
+			array(
+				'status'      => 'unconfirmed',
+				'error'       => wp_json_encode(
+					array(
+						'code'    => 'reservation_abandoned',
+						'message' => 'Reservation lease elapsed without a terminal result (process crash); reconciled to unconfirmed',
+					)
+				),
+				'executed_at' => current_time( 'mysql' ),
+			),
+			array(
+				'id'     => $row->id,
+				'status' => 'reserved',
+			),
+			array( '%s', '%s', '%s' ),
+			array( '%s', '%s' )
 		);
 	}
 
@@ -217,13 +297,18 @@ class Felix_Command_Ledger {
 	 * @return array
 	 */
 	public static function row_to_terminal_result( $row ) {
+		// Defensive against sparse rows (e.g. a freshly-reconciled unconfirmed
+		// row that has no result/processor_txn_ids yet).
+		$result_raw          = isset( $row->result ) ? $row->result : null;
+		$error_raw           = isset( $row->error ) ? $row->error : null;
+		$processor_txn_raw   = isset( $row->processor_txn_ids ) ? $row->processor_txn_ids : null;
 		return array(
-			'commandId'      => $row->id,
-			'status'         => $row->status,
-			'result'         => $row->result ? json_decode( $row->result, true ) : null,
-			'error'          => $row->error ? json_decode( $row->error, true ) : null,
-			'processorTxnIds' => $row->processor_txn_ids ? json_decode( $row->processor_txn_ids, true ) : array(),
-			'executedAt'     => $row->executed_at,
+			'commandId'      => isset( $row->id ) ? $row->id : null,
+			'status'         => isset( $row->status ) ? $row->status : 'unconfirmed',
+			'result'         => $result_raw ? json_decode( $result_raw, true ) : null,
+			'error'          => $error_raw ? json_decode( $error_raw, true ) : null,
+			'processorTxnIds' => $processor_txn_raw ? json_decode( $processor_txn_raw, true ) : array(),
+			'executedAt'     => isset( $row->executed_at ) ? $row->executed_at : current_time( 'mysql' ),
 		);
 	}
 
