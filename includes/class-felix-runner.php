@@ -36,6 +36,12 @@ class Felix_Runner {
 	/** @var int Max backoff for error retries. */
 	private $max_backoff_seconds = 30;
 
+	/** @var int Sleep between reservation_conflict retries (ms). */
+	private $reservation_conflict_retry_ms = 500;
+
+	/** @var int Max total time to wait for an in-flight reservation to reach a stored terminal (s). */
+	private $reservation_conflict_budget_seconds = 15;
+
 	/** @var string Holder ID for this runner instance. */
 	private $holder_id;
 
@@ -378,6 +384,32 @@ class Felix_Runner {
 		// terminal result back to Felix — direct REST path does not.
 		$terminal = $this->processor->process( $raw_body, $command );
 
+		// reservation_conflict is NONTERMINAL across ALL transports: another
+		// execution holds the ledger reservation and is still running. The poll
+		// path MUST NOT post this as a terminal 'rejected' — that would
+		// terminalize the backend command row and the in-flight handler's later
+		// result could no longer land. Preserve the same command and re-run the
+		// (idempotent) processor WITHOUT re-executing the handler until the
+		// stored terminal is available, then post THAT. The reservation gate
+		// guarantees the handler is never re-executed on retry.
+		if ( Felix_Command_Processor::is_reservation_conflict( $terminal ) ) {
+			$terminal = $this->await_reserved_terminal( $raw_body, $command, $terminal );
+		}
+
+		// If the conflict persisted past the retry budget, do NOT post a
+		// terminal — the backend command stays 'delivering', its lease expires,
+		// and the next poll redelivers + retrieves the stored terminal. Never
+		// terminalize a reservation_conflict.
+		if ( Felix_Command_Processor::is_reservation_conflict( $terminal ) ) {
+			$this->log(
+				sprintf(
+					'Command %s reservation_conflict persisted past retry budget; deferring (backend lease will requeue for later terminal retrieval)',
+					$command['commandId']
+				)
+			);
+			return true;
+		}
+
 		if ( 'rejected' === $terminal['status'] || 'failed' === $terminal['status'] ) {
 			$this->log( sprintf( 'Command %s → %s (%s)', $command['commandId'], $terminal['status'], $terminal['error']['code'] ?? 'unknown' ) );
 		} else {
@@ -393,6 +425,58 @@ class Felix_Runner {
 		);
 
 		return true;
+	}
+
+	/**
+	 * Re-run the idempotent processor for a reservation_conflict until the
+	 * in-flight handler reaches a terminal state (returning the STORED
+	 * terminal) or the retry budget is exhausted. The handler is NEVER
+	 * re-executed: the ledger reservation is held by the original execution,
+	 * so each retry is an idempotent duplicate read (or, once the lease
+	 * elapses, a stale-reservation reconciliation to honest `unconfirmed`).
+	 *
+	 * On budget exhaustion the conflict envelope is returned unchanged; the
+	 * caller MUST NOT post it as a terminal — the backend command stays
+	 * 'delivering', its lease expires, and the next poll redelivers.
+	 *
+	 * @param string $raw_body
+	 * @param array  $command
+	 * @param array  $conflict The initial reservation_conflict envelope.
+	 * @return array A genuine terminal envelope, or the conflict if exhausted.
+	 */
+	private function await_reserved_terminal( $raw_body, $command, $conflict ) {
+		$terminal = $conflict;
+		$deadline = time() + $this->reservation_conflict_budget_seconds;
+		$attempts = 0;
+
+		while ( time() < $deadline && Felix_Command_Processor::is_reservation_conflict( $terminal ) ) {
+			usleep( $this->reservation_conflict_retry_ms * 1000 );
+			$attempts++;
+			$terminal = $this->processor->process( $raw_body, $command );
+		}
+
+		$label = isset( $command['commandId'] ) ? $command['commandId'] : '?';
+		if ( Felix_Command_Processor::is_reservation_conflict( $terminal ) ) {
+			$this->log(
+				sprintf(
+					'Command %s still reserved after %d retries (%ds); deferring terminal post',
+					$label,
+					$attempts,
+					$this->reservation_conflict_budget_seconds
+				)
+			);
+		} else {
+			$this->log(
+				sprintf(
+					'Command %s reservation_conflict resolved to %s after %d retries',
+					$label,
+					isset( $terminal['status'] ) ? $terminal['status'] : '?',
+					$attempts
+				)
+			);
+		}
+
+		return $terminal;
 	}
 
 	/**

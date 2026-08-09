@@ -126,18 +126,25 @@ class Felix_REST {
 	 * Map a terminal envelope to an HTTP status code.
 	 *
 	 *   done / failed / unconfirmed → 200 (the command was processed)
-	 *   rejected (reservation_conflict) → 409 (in-flight elsewhere)
+	 *   reservation_conflict (nonterminal) → 409 (in-flight elsewhere; the
+	 *                                        backend requeues the same id)
 	 *   rejected (anything else)        → 422 (bad signature/auth/envelope)
+	 *
+	 * Uses the shared is_reservation_conflict() predicate so the nonterminal
+	 * classification is identical across the direct REST and poll transports.
 	 *
 	 * @param array $terminal
 	 * @return int
 	 */
 	private function http_status_for( $terminal ) {
+		if ( Felix_Command_Processor::is_reservation_conflict( $terminal ) ) {
+			return 409;
+		}
+
 		$status = isset( $terminal['status'] ) ? $terminal['status'] : '';
-		$code   = isset( $terminal['error']['code'] ) ? $terminal['error']['code'] : '';
 
 		if ( 'rejected' === $status ) {
-			return ( 'reservation_conflict' === $code ) ? 409 : 422;
+			return 422;
 		}
 
 		return 200;

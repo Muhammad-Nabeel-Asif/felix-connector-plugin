@@ -226,6 +226,29 @@ class Felix_Command_Processor {
 	}
 
 	/**
+	 * True when a terminal envelope is a NONTERMINAL reservation_conflict —
+	 * another execution holds the ledger reservation and is still running.
+	 *
+	 * This is the SINGLE classification shared by BOTH transports:
+	 *   - direct REST maps it to HTTP 409 (the backend requeues the same id).
+	 *   - the poll runner preserves the same command and re-runs the
+	 *     idempotent processor WITHOUT re-executing the handler until the
+	 *     stored terminal is available, then posts THAT.
+	 *
+	 * A reservation_conflict MUST NEVER be posted or recorded as a terminal
+	 * 'rejected' — that would terminalize the backend command row and the
+	 * in-flight handler's later result could no longer land.
+	 *
+	 * @param mixed $terminal
+	 * @return bool
+	 */
+	public static function is_reservation_conflict( $terminal ) {
+		return is_array( $terminal )
+			&& isset( $terminal['status'] ) && 'rejected' === $terminal['status']
+			&& isset( $terminal['error']['code'] ) && 'reservation_conflict' === $terminal['error']['code'];
+	}
+
+	/**
 	 * Validate the command envelope (store / generation / TTL).
 	 *
 	 * @param array $command

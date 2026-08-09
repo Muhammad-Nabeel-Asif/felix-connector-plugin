@@ -615,6 +615,88 @@ function test_fresh_reservation_not_reconciled() {
 }
 
 /**
+ * Fresh reservation_conflict is NONTERMINAL: the poll path must preserve the
+ * command and re-run the idempotent processor without re-executing the
+ * handler, retrieving the LATER stored terminal once the in-flight execution
+ * finishes — and never post a terminal 'rejected'. This is the contract the
+ * runner's await_reserved_terminal() retry relies on.
+ */
+function test_fresh_conflict_then_later_terminal_retrieval() {
+	echo "\n[fresh reservation_conflict then later terminal retrieval (nonterminal)]\n";
+	reset_state();
+	$secret = make_backend_key();
+	$proc   = new Felix_Command_Processor();
+
+	// Seed a FRESH reserved row — another execution holds the reservation and
+	// is still running (created moments ago, well within the 120s lease).
+	$env = make_envelope();
+	$GLOBALS['wpdb']->seed_row(
+		LEDGER_TABLE,
+		array(
+			'id'          => $env['commandId'],
+			'type'        => 'ping',
+			'status'      => 'reserved',
+			'executed_at' => current_time( 'mysql' ),
+			'created_at'  => gmdate( 'Y-m-d H:i:s', time() - 3 ), // 3s ago — fresh
+		)
+	);
+
+	list( $raw ) = sign_envelope( $env, $secret );
+
+	// First delivery while the reservation is live → reservation_conflict
+	// (NONTERMINAL). The handler must NOT run.
+	$before = $GLOBALS['__felix_handler_calls'];
+	$t      = $proc->process( $raw, json_decode( $raw, true ) );
+
+	expect( 'fresh conflict classified nonterminal', Felix_Command_Processor::is_reservation_conflict( $t ) );
+	expect_eq( 'fresh conflict => reservation_conflict code', $t['error']['code'], 'reservation_conflict' );
+	expect( 'handler NOT run on fresh conflict', $GLOBALS['__felix_handler_calls'] === $before );
+
+	// The poll runner would retry here. Simulate the in-flight execution
+	// reaching its terminal state: mark the reserved row done (the original
+	// handler completed). This is exactly what the holder's mark_terminal()
+	// does once the side-effecting work finishes.
+	Felix_Command_Ledger::mark_terminal(
+		$env['commandId'],
+		'done',
+		array( 'pong' => true )
+	);
+
+	// Retry (the same command, idempotent processor): the now-stored terminal
+	// is retrieved WITHOUT re-executing the handler.
+	$calls_before = $GLOBALS['__felix_handler_calls'];
+	$t2           = $proc->process( $raw, json_decode( $raw, true ) );
+
+	expect( 'later retrieval no longer a reservation_conflict', ! Felix_Command_Processor::is_reservation_conflict( $t2 ) );
+	expect_eq( 'later retrieval returns stored terminal done', $t2['status'], 'done' );
+	expect( 'later retrieval marked alreadyExecuted (idempotent)', ! empty( $t2['alreadyExecuted'] ) );
+	expect( 'later retrieval did NOT re-run handler', $GLOBALS['__felix_handler_calls'] === $calls_before );
+	expect_eq( 'later retrieval returns stored pong', $t2['result']['pong'], true );
+
+	// REST transport maps a FRESH conflict to 409 (nonterminal) using the same
+	// shared predicate — proving the classification is consistent across both
+	// transports (REST 409 + poll retry/defer, never a posted terminal rejected).
+	reset_state();
+	$secret2 = make_backend_key();
+	$env2    = make_envelope();
+	$GLOBALS['wpdb']->seed_row(
+		LEDGER_TABLE,
+		array(
+			'id'          => $env2['commandId'],
+			'type'        => 'ping',
+			'status'      => 'reserved',
+			'executed_at' => current_time( 'mysql' ),
+			'created_at'  => gmdate( 'Y-m-d H:i:s', time() - 2 ),
+		)
+	);
+	list( $raw2 ) = sign_envelope( $env2, $secret2 );
+	$resp = ( new Felix_REST() )->handle_command( new Fake_REST_Request( $raw2 ) );
+	expect_eq( 'REST maps fresh conflict => 409 (nonterminal)', $resp->get_status(), 409 );
+	expect_eq( 'REST conflict body status rejected', $resp->get_data()['status'], 'rejected' );
+	expect_eq( 'REST conflict body code reservation_conflict', $resp->get_data()['error']['code'], 'reservation_conflict' );
+}
+
+/**
  * #6 — enumeration completeness: renew_subscription has a family AND a handler
  * (the gap was: family_map named it, the adapter called it, but no handler was
  * registered → unknown_type). Also asserts every produced type has a family.
@@ -694,6 +776,7 @@ test_canonical_json_contract();
 test_signature_with_url_and_unicode();
 test_stale_reservation_reconciled();
 test_fresh_reservation_not_reconciled();
+test_fresh_conflict_then_later_terminal_retrieval();
 test_renew_handler_registered();
 test_authorization_basis_object_form();
 
