@@ -4,7 +4,7 @@ Tags: woocommerce, customer service, ai, automation, ecommerce
 Requires at least: 6.0
 Tested up to: 6.5
 Requires PHP: 8.1
-Stable tag: 0.4.0
+Stable tag: 0.4.1
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -89,6 +89,9 @@ Copy the cron command from WooCommerce → Felix Connector → Advanced & Troubl
 A scheduled task and the WordPress built-in scheduler can coexist safely — they share a lock so commands are never double-executed.
 
 == Changelog ==
+
+= 0.4.1 =
+* Cross-language canonical JSON fixture: adds an astral-key (non-BMP) ordering case proving Node's canonical encoder now sorts object keys by UTF-8 byte value, matching PHP `ksort` byte-for-byte. No runtime behavior change for BMP keys (the realistic command-envelope case); astral keys now verify correctly where UTF-16 code-unit ordering previously diverged.
 
 = 0.4.0 =
 * New: inbound direct command delivery via POST /wp-json/felix/v1/command — Felix can now push signed commands to the store directly (no longer long-poll-only)
