@@ -14,8 +14,10 @@
  *   - coupon_read: get_coupon, list_coupons
  *   - customer_read: list_customers
  *   - order_write: update_order_status, update_order_shipping_address
+ *   - order_create: create_order
  *   - coupon_write: create_coupon, update_coupon, deactivate_coupon
  *   - subscription_write: update_subscription_status, renew_subscription
+ *   - customer_write: delete_customer
  *   - webhook_management: register_webhooks, verify_webhooks, remove_webhooks
  *   - sync: sync_orders, sync_products, sync_coupons
  *   - refund: refund.create
@@ -63,12 +65,14 @@ class Felix_Command_Handlers {
 		'sync_coupons'                => 'sync',
 		'update_order_status'         => 'order_write',
 		'update_order_shipping_address' => 'order_write',
+		'create_order'                => 'order_create',
 		'create_coupon'               => 'coupon_write',
 		'update_coupon'               => 'coupon_write',
 		'deactivate_coupon'           => 'coupon_write',
 		'update_subscription_status'  => 'subscription_write',
 		'renew_subscription'          => 'subscription_write',
 		'refund.create'               => 'refund',
+		'delete_customer'             => 'customer_write',
 	);
 
 	/**
@@ -103,6 +107,7 @@ class Felix_Command_Handlers {
 			'sync_orders'   => array( $this, 'handle_sync_orders' ),
 
 			// Product reads
+			'get_product'   => array( $this, 'handle_get_product' ),
 			'list_products' => array( $this, 'handle_list_products' ),
 
 			// Sync (paged product backfill)
@@ -116,9 +121,24 @@ class Felix_Command_Handlers {
 			'list_subscriptions'               => array( $this, 'handle_list_subscriptions' ),
 			'list_subscriptions_for_customer'  => array( $this, 'handle_list_subscriptions_for_customer' ),
 
+			// Coupon reads
+			'get_coupon'   => array( $this, 'handle_get_coupon' ),
+			'list_coupons' => array( $this, 'handle_list_coupons' ),
+
+			// Sync (paged coupon backfill)
+			'sync_coupons' => array( $this, 'handle_sync_coupons' ),
+
+			// Webhook management
+			'register_webhooks' => array( $this, 'handle_register_webhooks' ),
+			'verify_webhooks'   => array( $this, 'handle_verify_webhooks' ),
+			'remove_webhooks'   => array( $this, 'handle_remove_webhooks' ),
+
 			// Order writes
 			'update_order_status'         => array( $this, 'handle_update_order_status' ),
 			'update_order_shipping_address' => array( $this, 'handle_update_order_shipping_address' ),
+
+			// Order creation (write)
+			'create_order' => array( $this, 'handle_create_order' ),
 
 			// Coupon writes
 			'create_coupon'     => array( $this, 'handle_create_coupon' ),
@@ -128,6 +148,12 @@ class Felix_Command_Handlers {
 			// Subscription writes
 			'update_subscription_status' => array( $this, 'handle_update_subscription_status' ),
 			'renew_subscription'         => array( $this, 'handle_renew_subscription' ),
+
+			// Refunds
+			'refund.create' => array( $this, 'handle_refund_create' ),
+
+			// Customer writes
+			'delete_customer' => array( $this, 'handle_delete_customer' ),
 		);
 	}
 
@@ -479,6 +505,54 @@ class Felix_Command_Handlers {
 		);
 	}
 
+	/**
+	 * Handler: get_product — fetch a single product by ID or SKU.
+	 *
+	 * Returns the list_products item shape plus the full description,
+	 * stock quantity, and category names.
+	 */
+	private function handle_get_product( $args, $command_id ) {
+		$this->require_woocommerce();
+
+		$product_id = $args['productId'] ?? null;
+		$sku        = $args['sku'] ?? null;
+
+		if ( ! $product_id && ! $sku ) {
+			throw new Exception( 'get_product requires productId or sku' );
+		}
+
+		if ( ! $product_id && $sku ) {
+			if ( function_exists( 'wc_get_product_id_by_sku' ) ) {
+				$product_id = wc_get_product_id_by_sku( $sku );
+			}
+			if ( ! $product_id ) {
+				throw new Exception( sprintf( 'Product with sku %s not found', $sku ) );
+			}
+		}
+
+		$product = wc_get_product( $product_id );
+		if ( ! $product ) {
+			throw new Exception( sprintf( 'Product %s not found', $product_id ) );
+		}
+
+		$data = $this->serialize_product( $product );
+
+		// Append categories (list_products item shape does not include them).
+		$terms              = function_exists( 'get_the_terms' ) ? get_the_terms( $product->get_id(), 'product_cat' ) : false;
+		$data['categories'] = ( is_array( $terms ) )
+			? array_map(
+				function ( $term ) {
+					return $term->name;
+				},
+				$terms
+			)
+			: array();
+
+		return array(
+			'result' => array( 'product' => $data ),
+		);
+	}
+
 	// ------------------------------------------------------------------------
 	// Handlers — Sync (paged backfill for the data mirror)
 	// -------------------------------------------------------------------------
@@ -555,6 +629,127 @@ class Felix_Command_Handlers {
 
 		return array(
 			'result' => array( 'products' => $serialized ),
+		);
+	}
+
+	/**
+	 * Handler: sync_coupons — paged coupon backfill by modified_after cursor.
+	 *
+	 * Mirrors handle_sync_orders: paged, modified_after cursor, ASC by
+	 * modified. Coupons are a CPT (shop_coupon) so the backfill uses a
+	 * WP_Query on post_modified rather than wc_get_orders.
+	 */
+	private function handle_sync_coupons( $args, $command_id ) {
+		$this->require_woocommerce();
+
+		$modified_after = $args['modifiedAfter'] ?? $args['modified_after'] ?? null;
+		$limit          = min( intval( $args['limit'] ?? 100 ), 100 );
+		$page           = max( intval( $args['page'] ?? 1 ), 1 );
+
+		$query_args = array(
+			'post_type'      => 'shop_coupon',
+			'post_status'    => 'any',
+			'posts_per_page' => $limit,
+			'paged'          => $page,
+			'orderby'        => 'modified',
+			'order'          => 'ASC',
+			'no_found_rows'  => true,
+		);
+
+		if ( $modified_after ) {
+			$query_args['date_query'] = array(
+				array(
+					'column' => 'post_modified',
+					'after'  => $modified_after,
+				),
+			);
+		}
+
+		$query = new WP_Query( $query_args );
+
+		$serialized = array();
+		foreach ( $query->posts as $post ) {
+			$coupon = new WC_Coupon( $post->ID );
+			if ( $coupon->get_id() ) {
+				$serialized[] = $this->serialize_coupon( $coupon );
+			}
+		}
+
+		return array(
+			'result' => array( 'coupons' => $serialized ),
+		);
+	}
+
+	// -------------------------------------------------------------------------
+	// Handlers — Coupon Reads
+	// -------------------------------------------------------------------------
+
+	/**
+	 * Handler: get_coupon — fetch a single coupon by code or couponId.
+	 */
+	private function handle_get_coupon( $args, $command_id ) {
+		$this->require_woocommerce();
+
+		$code = $args['code'] ?? null;
+		$id   = $args['couponId'] ?? null;
+
+		if ( ! $code && ! $id ) {
+			throw new Exception( 'get_coupon requires code or couponId' );
+		}
+
+		$coupon = $code ? new WC_Coupon( wc_sanitize_coupon_code( $code ) ) : new WC_Coupon( $id );
+		if ( ! $coupon->get_id() ) {
+			throw new Exception( 'Coupon not found' );
+		}
+
+		return array(
+			'result' => array( 'coupon' => $this->serialize_coupon( $coupon ) ),
+		);
+	}
+
+	/**
+	 * Handler: list_coupons — paged coupon list with optional search.
+	 *
+	 * @param array $args {page?, perPage? (cap 50), search?}
+	 */
+	private function handle_list_coupons( $args, $command_id ) {
+		$this->require_woocommerce();
+
+		$page     = max( intval( $args['page'] ?? 1 ), 1 );
+		$per_page = min( max( intval( $args['perPage'] ?? $args['per_page'] ?? 20 ), 1 ), 50 );
+
+		$query_args = array(
+			'post_type'      => 'shop_coupon',
+			'post_status'    => 'any',
+			'posts_per_page' => $per_page,
+			'paged'          => $page,
+			'orderby'        => 'date',
+			'order'          => 'DESC',
+			'no_found_rows'  => false,
+		);
+
+		if ( isset( $args['search'] ) ) {
+			$query_args['s'] = $args['search'];
+		}
+
+		$query = new WP_Query( $query_args );
+
+		$coupons = array();
+		foreach ( $query->posts as $post ) {
+			$coupon = new WC_Coupon( $post->ID );
+			if ( $coupon->get_id() ) {
+				$coupons[] = $this->serialize_coupon( $coupon );
+			}
+		}
+
+		$has_more = ( $page * $per_page ) < (int) $query->found_posts;
+
+		return array(
+			'result' => array(
+				'coupons' => $coupons,
+				'page'    => $page,
+				'hasMore' => $has_more,
+			),
 		);
 	}
 
@@ -1000,6 +1195,437 @@ class Felix_Command_Handlers {
 	}
 
 	// -------------------------------------------------------------------------
+	// Handlers — Webhook Management
+	// -------------------------------------------------------------------------
+
+	/**
+	 * Handler: register_webhooks — create a WC_Webhook (active, wp_api_v3) per
+	 * topic, idempotently. A webhook matching BOTH deliveryUrl and topic is
+	 * skipped (not duplicated).
+	 *
+	 * @param array $args {deliveryUrl, secret, topics[]}
+	 */
+	private function handle_register_webhooks( $args, $command_id ) {
+		$this->require_woocommerce();
+
+		$delivery_url = $args['deliveryUrl'] ?? null;
+		$secret       = $args['secret'] ?? '';
+		$topics       = $args['topics'] ?? null;
+
+		if ( ! $delivery_url || ! is_array( $topics ) || empty( $topics ) ) {
+			throw new Exception( 'register_webhooks requires deliveryUrl and topics' );
+		}
+
+		// Build an idempotency index of existing (delivery_url, topic) pairs.
+		$existing = function_exists( 'wc_get_webhooks' ) ? wc_get_webhooks( array( 'status' => 'any' ) ) : array();
+		$index    = array();
+		foreach ( $existing as $webhook ) {
+			$key = $webhook->get_delivery_url() . '|' . $webhook->get_topic();
+			if ( ! isset( $index[ $key ] ) ) {
+				$index[ $key ] = $webhook->get_id();
+			}
+		}
+
+		$registered = array();
+		$skipped    = array();
+
+		foreach ( $topics as $topic ) {
+			$key = $delivery_url . '|' . $topic;
+			if ( isset( $index[ $key ] ) ) {
+				$skipped[] = array(
+					'topic' => $topic,
+					'id'    => $index[ $key ],
+				);
+				continue;
+			}
+
+			$webhook = new WC_Webhook();
+			$webhook->set_name( 'Felix' );
+			$webhook->set_status( 'active' );
+			$webhook->set_topic( $topic );
+			$webhook->set_delivery_url( $delivery_url );
+			$webhook->set_secret( $secret );
+			if ( method_exists( $webhook, 'set_api_version' ) ) {
+				$webhook->set_api_version( 3 ); // wp_api_v3.
+			}
+			$webhook->save();
+
+			// Record the new pair so duplicate topics within this same call skip too.
+			$index[ $key ]      = $webhook->get_id();
+			$registered[] = array(
+				'id'    => $webhook->get_id(),
+				'topic' => $topic,
+			);
+		}
+
+		return array(
+			'result' => array(
+				'registered' => $registered,
+				'skipped'    => $skipped,
+			),
+		);
+	}
+
+	/**
+	 * Handler: verify_webhooks — report which topics have an active webhook for
+	 * the given deliveryUrl, which are missing, and which exist but are
+	 * disabled (paused).
+	 *
+	 * @param array $args {deliveryUrl, topics[]}
+	 */
+	private function handle_verify_webhooks( $args, $command_id ) {
+		$this->require_woocommerce();
+
+		$delivery_url = $args['deliveryUrl'] ?? null;
+		$topics       = $args['topics'] ?? null;
+
+		if ( ! $delivery_url || ! is_array( $topics ) ) {
+			throw new Exception( 'verify_webhooks requires deliveryUrl and topics' );
+		}
+
+		$existing = function_exists( 'wc_get_webhooks' ) ? wc_get_webhooks( array( 'status' => 'any' ) ) : array();
+		$by_topic = array();
+		foreach ( $existing as $webhook ) {
+			if ( $webhook->get_delivery_url() === $delivery_url ) {
+				$by_topic[ $webhook->get_topic() ] = array(
+					'status' => $webhook->get_status(),
+					'id'     => $webhook->get_id(),
+				);
+			}
+		}
+
+		$active   = array();
+		$missing  = array();
+		$disabled = array();
+
+		foreach ( $topics as $topic ) {
+			if ( ! isset( $by_topic[ $topic ] ) ) {
+				$missing[] = $topic;
+			} elseif ( 'active' === $by_topic[ $topic ]['status'] ) {
+				$active[] = $topic;
+			} else {
+				$disabled[] = array(
+					'topic'  => $topic,
+					'status' => $by_topic[ $topic ]['status'],
+				);
+			}
+		}
+
+		return array(
+			'result' => array(
+				'active'   => $active,
+				'missing'  => $missing,
+				'disabled' => $disabled,
+			),
+		);
+	}
+
+	/**
+	 * Handler: remove_webhooks — delete every webhook whose delivery_url matches.
+	 *
+	 * @param array $args {deliveryUrl}
+	 */
+	private function handle_remove_webhooks( $args, $command_id ) {
+		$this->require_woocommerce();
+
+		$delivery_url = $args['deliveryUrl'] ?? null;
+		if ( ! $delivery_url ) {
+			throw new Exception( 'remove_webhooks requires deliveryUrl' );
+		}
+
+		$existing = function_exists( 'wc_get_webhooks' ) ? wc_get_webhooks( array( 'status' => 'any' ) ) : array();
+		$removed  = 0;
+		foreach ( $existing as $webhook ) {
+			if ( $webhook->get_delivery_url() === $delivery_url ) {
+				$webhook->delete();
+				$removed++;
+			}
+		}
+
+		return array(
+			'result' => array(
+				'removed' => $removed,
+			),
+		);
+	}
+
+	// -------------------------------------------------------------------------
+	// Handlers — Refunds
+	// -------------------------------------------------------------------------
+
+	/**
+	 * Handler: refund.create — issue a refund for an order via wc_create_refund.
+	 *
+	 * Validates the amount against the order's remaining refundable total
+	 * (order total − already refunded) BEFORE calling wc_create_refund. A
+	 * WP_Error or false return is surfaced with the store's own message, and
+	 * success is NEVER reported without a concrete refund id.
+	 *
+	 * @param array $args {orderId, amount, reason, refundPayment?}
+	 */
+	private function handle_refund_create( $args, $command_id ) {
+		$this->require_woocommerce();
+
+		$order_id = $args['orderId'] ?? null;
+		$amount   = $args['amount'] ?? null;
+
+		if ( ! $order_id || null === $amount ) {
+			throw new Exception( 'refund.create requires orderId and amount' );
+		}
+
+		$order = wc_get_order( $order_id );
+		if ( ! $order ) {
+			throw new Exception( sprintf( 'Order %s not found', $order_id ) );
+		}
+
+		$total     = (float) $order->get_total();
+		$refunded  = (float) $order->get_total_refunded();
+		$remaining = $total - $refunded;
+
+		if ( (float) $amount > $remaining ) {
+			throw new Exception( sprintf( 'Refund amount %s exceeds remaining refundable total %s', $amount, $remaining ) );
+		}
+
+		$refund = wc_create_refund(
+			array(
+				'amount'         => $amount,
+				'reason'         => $args['reason'] ?? '',
+				'order_id'       => $order_id,
+				'refund_payment' => isset( $args['refundPayment'] ) ? (bool) $args['refundPayment'] : true,
+				'restock_items'  => true,
+			)
+		);
+
+		if ( is_wp_error( $refund ) || ! $refund ) {
+			$message = is_wp_error( $refund ) ? $refund->get_error_message() : 'wc_create_refund returned no refund';
+			throw new Exception( $message );
+		}
+
+		$refund_id = $refund->get_id();
+		if ( ! $refund_id ) {
+			throw new Exception( 'wc_create_refund returned a refund without an id' );
+		}
+
+		// Re-fetch the order so the order projection reflects the new totals.
+		$order = wc_get_order( $order_id );
+
+		$date_created = method_exists( $refund, 'get_date_created' ) ? $refund->get_date_created() : null;
+
+		return array(
+			'result' => array(
+				'refund' => array(
+					'id'          => $refund_id,
+					'amount'      => $refund->get_amount(),
+					'reason'      => $refund->get_reason(),
+					'dateCreated' => ( $date_created && method_exists( $date_created, 'date' ) ) ? $date_created->date( 'c' ) : null,
+				),
+				'order'  => array(
+					'id'            => $order->get_id(),
+					'status'        => $order->get_status(),
+					'totalRefunded' => $order->get_total_refunded(),
+				),
+			),
+		);
+	}
+
+	// -------------------------------------------------------------------------
+	// Handlers — Order Creation (write)
+	// -------------------------------------------------------------------------
+
+	/**
+	 * Handler: create_order — create a new order from line items.
+	 *
+	 * Resolution: customerId or email → set_customer_id. Products are added,
+	 * addresses applied, totals calculated, then zero-price (complimentary-
+	 * order) overrides are applied AFTER calculate_totals so they stick.
+	 *
+	 * @param array $args {
+	 *   customerId? or email, lineItems:[{productId, quantity, priceOverride?}],
+	 *   shippingAddress?, status? default 'processing', note?
+	 * }
+	 */
+	private function handle_create_order( $args, $command_id ) {
+		$this->require_woocommerce();
+
+		$line_items = $args['lineItems'] ?? null;
+		if ( ! is_array( $line_items ) || empty( $line_items ) ) {
+			throw new Exception( 'create_order requires lineItems' );
+		}
+
+		// Resolve customer.
+		$customer_id = $args['customerId'] ?? null;
+		$email       = $args['email'] ?? null;
+		if ( ! $customer_id && $email && function_exists( 'get_user_by' ) ) {
+			$user = get_user_by( 'email', $email );
+			if ( $user ) {
+				$customer_id = $user->ID;
+			}
+		}
+
+		$order = wc_create_order();
+
+		if ( $customer_id ) {
+			$order->set_customer_id( (int) $customer_id );
+		}
+
+		// Add products (records the catalog price per line).
+		foreach ( $line_items as $li ) {
+			$product_id = $li['productId'] ?? null;
+			if ( ! $product_id ) {
+				throw new Exception( 'each lineItem requires productId' );
+			}
+			$qty = isset( $li['quantity'] ) ? max( (int) $li['quantity'], 1 ) : 1;
+
+			$product = wc_get_product( $product_id );
+			if ( ! $product ) {
+				throw new Exception( sprintf( 'Product %s not found', $product_id ) );
+			}
+			$order->add_product( $product, $qty );
+		}
+
+		// Addresses.
+		if ( isset( $args['shippingAddress'] ) && is_array( $args['shippingAddress'] ) ) {
+			$order->set_address( $this->map_address( $args['shippingAddress'] ), 'shipping' );
+		}
+		if ( isset( $args['billingAddress'] ) && is_array( $args['billingAddress'] ) ) {
+			$order->set_address( $this->map_address( $args['billingAddress'] ), 'billing' );
+		}
+
+		$order->calculate_totals();
+
+		// Zero-price (comp-order) overrides applied AFTER calculate_totals so
+		// the override survives (calculate would otherwise re-price from the
+		// catalog). The order total is recomputed from the overridden lines.
+		$items = $order->get_items();
+		$keys  = array_keys( $items );
+		$idx   = 0;
+		$recalc = false;
+		foreach ( $line_items as $li ) {
+			if ( array_key_exists( 'priceOverride', $li ) ) {
+				$item = isset( $keys[ $idx ] ) ? $items[ $keys[ $idx ] ] : null;
+				if ( $item ) {
+					$override_total = (float) $li['priceOverride'] * (int) ( $item->get_quantity() ? $item->get_quantity() : ( $li['quantity'] ?? 1 ) );
+					if ( method_exists( $item, 'set_subtotal' ) ) {
+						$item->set_subtotal( $override_total );
+					}
+					if ( method_exists( $item, 'set_total' ) ) {
+						$item->set_total( $override_total );
+					}
+					if ( method_exists( $item, 'save' ) ) {
+						$item->save();
+					}
+					$recalc = true;
+				}
+			}
+			$idx++;
+		}
+
+		if ( $recalc ) {
+			// Recompute the order total from the overridden line totals WITHOUT
+			// calling calculate_totals() again (which would revert overrides).
+			$sum = 0;
+			foreach ( $order->get_items() as $item ) {
+				$sum += (float) $item->get_total();
+			}
+			if ( method_exists( $order, 'set_total' ) ) {
+				$order->set_total( $sum );
+			}
+		}
+
+		if ( ! empty( $args['note'] ) ) {
+			$order->add_order_note( $args['note'] );
+		}
+
+		$status = $args['status'] ?? 'processing';
+		$order->set_status( $status );
+		$order->save();
+
+		$line_projection = array_map(
+			function ( $item ) {
+				return array(
+					'productId' => $item->get_product_id(),
+					'name'      => $item->get_name(),
+					'quantity'  => $item->get_quantity(),
+					'total'     => $item->get_total(),
+				);
+			},
+			$order->get_items()
+		);
+
+		return array(
+			'result' => array(
+				'order' => array(
+					'id'        => $order->get_id(),
+					'number'    => $order->get_order_number(),
+					'status'    => $order->get_status(),
+					'total'     => $order->get_total(),
+					'lineItems' => $line_projection,
+				),
+			),
+		);
+	}
+
+	// -------------------------------------------------------------------------
+	// Handlers — Customer Writes
+	// -------------------------------------------------------------------------
+
+	/**
+	 * Handler: delete_customer — delete a WP user that MUST hold the customer
+	 * role. Admins and shop-managers are explicitly refused (never deleted),
+	 * regardless of who authorized the command.
+	 *
+	 * Orders are retained (wp_delete_user's default reassigns their authorship
+	 * rather than destroying order history).
+	 *
+	 * @param array $args {customerId? or email}
+	 */
+	private function handle_delete_customer( $args, $command_id ) {
+		$this->require_woocommerce();
+
+		$customer_id = $args['customerId'] ?? null;
+		$email       = $args['email'] ?? null;
+
+		if ( ! $customer_id && ! $email ) {
+			throw new Exception( 'delete_customer requires customerId or email' );
+		}
+
+		$user = null;
+		if ( $customer_id ) {
+			$user = function_exists( 'get_userdata' ) ? get_userdata( $customer_id ) : null;
+		} else {
+			$user = function_exists( 'get_user_by' ) ? get_user_by( 'email', $email ) : null;
+		}
+
+		if ( ! $user ) {
+			throw new Exception( 'Customer not found' );
+		}
+
+		// Role enforcement: only the customer role may be deleted.
+		$roles       = isset( $user->roles ) ? (array) $user->roles : array();
+		$is_customer = in_array( 'customer', $roles, true );
+		if ( ! $is_customer ) {
+			$role_label = ! empty( $roles ) ? implode( ',', $roles ) : 'unknown';
+			throw new Exception( sprintf( 'Refusing to delete non-customer user (role: %s)', $role_label ) );
+		}
+
+		if ( ! function_exists( 'wp_delete_user' ) ) {
+			require_once ABSPATH . 'wp-admin/includes/user.php';
+		}
+		$ok = wp_delete_user( $user->ID );
+		if ( ! $ok ) {
+			throw new Exception( 'wp_delete_user failed' );
+		}
+
+		return array(
+			'result' => array(
+				'deleted'        => true,
+				'customerId'     => $user->ID,
+				'ordersRetained' => true,
+			),
+		);
+	}
+
+	// -------------------------------------------------------------------------
 	// Serialization
 	// -------------------------------------------------------------------------
 
@@ -1120,6 +1746,71 @@ class Felix_Command_Handlers {
 			'shortDescription' => $product->get_short_description(),
 			'permalink'   => $product->get_permalink(),
 		);
+	}
+
+	/**
+	 * Serialize a WC_Coupon to the projection shared by get_coupon / list_coupons /
+	 * sync_coupons.
+	 *
+	 * dateExpires is tolerant: WC_Coupon::get_date_expires() returns a
+	 * WC_DateTime|null in modern WC, but historically returned a timestamp.
+	 */
+	private function serialize_coupon( $coupon ) {
+		$expires_raw = method_exists( $coupon, 'get_date_expires' ) ? $coupon->get_date_expires() : null;
+		$date_expires = null;
+		if ( $expires_raw ) {
+			if ( is_object( $expires_raw ) && method_exists( $expires_raw, 'date' ) ) {
+				$date_expires = $expires_raw->date( 'c' );
+			} else {
+				$date_expires = date( 'c', (int) $expires_raw );
+			}
+		}
+
+		return array(
+			'id'           => $coupon->get_id(),
+			'code'         => $coupon->get_code(),
+			'discountType' => $coupon->get_discount_type(),
+			'amount'       => $coupon->get_amount(),
+			'status'       => $coupon->get_status(),
+			'dateExpires'  => $date_expires,
+			'usageCount'   => $coupon->get_usage_count(),
+			'usageLimit'   => $coupon->get_usage_limit(),
+			'freeShipping' => (bool) $coupon->get_free_shipping(),
+			'productIds'   => $coupon->get_product_ids(),
+		);
+	}
+
+	/**
+	 * Map a camelCase address payload to the snake_case keys WC_Order::set_address
+	 * expects ('first_name', 'address_1', etc.). Accepts both shapes.
+	 *
+	 * @param array $address
+	 * @return array
+	 */
+	private function map_address( $address ) {
+		$keys = array(
+			'firstName' => 'first_name',
+			'lastName'  => 'last_name',
+			'company'   => 'company',
+			'address1'  => 'address_1',
+			'address2'  => 'address_2',
+			'city'      => 'city',
+			'state'     => 'state',
+			'postcode'  => 'postcode',
+			'country'   => 'country',
+			'phone'     => 'phone',
+			'email'     => 'email',
+		);
+
+		$out = array();
+		foreach ( $keys as $camel => $snake ) {
+			if ( isset( $address[ $camel ] ) ) {
+				$out[ $snake ] = $address[ $camel ];
+			} elseif ( isset( $address[ $snake ] ) ) {
+				$out[ $snake ] = $address[ $snake ];
+			}
+		}
+		return $out;
 	}
 }
 
