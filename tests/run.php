@@ -486,6 +486,26 @@ function test_canonical_json_contract() {
 	// Arrays preserve element order (NOT sorted).
 	$arr = Felix_Crypto::canonical_json( array( 'list' => array( 3, 1, 2 ) ) );
 	expect_eq( 'array order preserved', $arr, '{"list":[3,1,2]}' );
+
+	// P0 cross-repo fixture: a representative command envelope (ISO date + URL
+	// + nested objects) canonicalizes to an EXACT byte string. The backend's
+	// canonicalCommandJson() MUST produce the IDENTICAL bytes (pinned in
+	// connector-outbound.service.spec.ts). Any drift breaks Ed25519 verification.
+	$envelope = array(
+		'protocolVersion'     => 1,
+		'commandId'           => 'cmd-123',
+		'storeId'             => 'store-abc',
+		'generation'          => 7,
+		'type'                => 'search_orders',
+		'args'                => array( 'email' => 'jose@example.com', 'url' => 'https://shop.example.com/p' ),
+		'authorizationBasis'  => array( 'kind' => 'graduated_rule', 'ruleId' => 'connector-read' ),
+		'issuedAt'            => '2026-01-15T12:30:00.000Z',
+		'ttlSeconds'          => 120,
+		'nonce'               => 'nonce-abc',
+		'keyId'               => 'cmd-sign-v1',
+	);
+	$expected = '{"args":{"email":"jose@example.com","url":"https:\/\/shop.example.com\/p"},"authorizationBasis":{"kind":"graduated_rule","ruleId":"connector-read"},"commandId":"cmd-123","generation":7,"issuedAt":"2026-01-15T12:30:00.000Z","keyId":"cmd-sign-v1","nonce":"nonce-abc","protocolVersion":1,"storeId":"store-abc","ttlSeconds":120,"type":"search_orders"}';
+	expect_eq( 'cross-repo fixture vector matches backend byte-for-byte', Felix_Crypto::canonical_json( $envelope ), $expected );
 }
 
 /**
