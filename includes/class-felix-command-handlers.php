@@ -362,6 +362,86 @@ class Felix_Command_Handlers {
 		}
 	}
 
+	/**
+	 * Validate a webhook delivery URL is a safe target for the store to POST
+	 * to: the scheme MUST be https, the host MUST NOT be 'localhost', and an
+	 * IP-literal host MUST NOT fall in a private or reserved range (SSRF guard
+	 * for register_webhooks).
+	 *
+	 * @throws Exception on any disallowed scheme/host.
+	 *
+	 * @param string $delivery_url
+	 */
+	private function validate_delivery_url( $delivery_url ) {
+		$parsed = parse_url( (string) $delivery_url );
+		if ( ! is_array( $parsed ) || empty( $parsed['scheme'] ) || empty( $parsed['host'] ) ) {
+			throw new Exception( 'register_webhooks deliveryUrl must be an absolute https URL' );
+		}
+		if ( strtolower( (string) $parsed['scheme'] ) !== 'https' ) {
+			throw new Exception( sprintf( 'register_webhooks deliveryUrl must use the https scheme (got %s)', $parsed['scheme'] ) );
+		}
+
+		// parse_url may return IPv6 literals with or without their enclosing
+		// brackets depending on the PHP version; normalize by stripping [] so
+		// filter_var/inet_pton see the bare address.
+		$host = strtolower( (string) $parsed['host'] );
+		if ( strlen( $host ) >= 2 && '[' === substr( $host, 0, 1 ) && ']' === substr( $host, -1 ) ) {
+			$host = substr( $host, 1, -1 );
+		}
+
+		if ( 'localhost' === $host ) {
+			throw new Exception( 'register_webhooks deliveryUrl must not target localhost' );
+		}
+
+		$is_v4 = filter_var( $host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4 );
+		$is_v6 = filter_var( $host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6 );
+		if ( false === $is_v4 && false === $is_v6 ) {
+			return; // A named host (e.g. felix.example.com) — not an IP literal.
+		}
+
+		$packed = @inet_pton( $host );
+		if ( false === $packed ) {
+			throw new Exception( sprintf( 'register_webhooks deliveryUrl host is not a valid IP (%s)', $host ) );
+		}
+
+		$private = false;
+		if ( false !== $is_v4 && 4 === strlen( $packed ) ) {
+			$b0 = ord( $packed[0] );
+			$b1 = ord( $packed[1] );
+			// 10.0.0.0/8
+			if ( 10 === $b0 ) {
+				$private = true;
+			} elseif ( 172 === $b0 && $b1 >= 16 && $b1 <= 31 ) {
+				// 172.16.0.0/12
+				$private = true;
+			} elseif ( 192 === $b0 && 168 === $b1 ) {
+				// 192.168.0.0/16
+				$private = true;
+			} elseif ( 127 === $b0 ) {
+				// 127.0.0.0/8 (loopback)
+				$private = true;
+			} elseif ( 169 === $b0 && 254 === $b1 ) {
+				// 169.254.0.0/16 (link-local)
+				$private = true;
+			}
+		} elseif ( false !== $is_v6 && 16 === strlen( $packed ) ) {
+			// ::1 (loopback).
+			if ( "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01" === $packed ) {
+				$private = true;
+			} else {
+				// fc00::/7 — unique-local. Top 7 bits 1111110 => first byte 0xFC|0xFD.
+				$b0 = ord( $packed[0] );
+				if ( 0xFC === $b0 || 0xFD === $b0 ) {
+					$private = true;
+				}
+			}
+		}
+
+		if ( $private ) {
+			throw new Exception( sprintf( 'register_webhooks deliveryUrl must not target a private or reserved IP range (%s)', $host ) );
+		}
+	}
+
 	// -------------------------------------------------------------------------
 	// Handlers — System
 	// -------------------------------------------------------------------------
@@ -1216,6 +1296,10 @@ class Felix_Command_Handlers {
 			throw new Exception( 'register_webhooks requires deliveryUrl and topics' );
 		}
 
+		// SSRF guard: the store will POST to this URL, so it must be https and
+		// must not target localhost or a private/reserved IP range.
+		$this->validate_delivery_url( $delivery_url );
+
 		// Build an idempotency index of existing (delivery_url, topic) pairs.
 		$existing = function_exists( 'wc_get_webhooks' ) ? wc_get_webhooks( array( 'status' => 'any' ) ) : array();
 		$index    = array();
@@ -1382,6 +1466,13 @@ class Felix_Command_Handlers {
 		$refunded  = (float) $order->get_total_refunded();
 		$remaining = $total - $refunded;
 
+		// A non-positive amount must be rejected BEFORE the over-refund guard:
+		// a negative amount never satisfies `> $remaining`, so it would slip
+		// past the upper-bound check and reach wc_create_refund unchecked.
+		if ( (float) $amount <= 0 ) {
+			throw new Exception( sprintf( 'Refund amount %s must be greater than zero', $amount ) );
+		}
+
 		if ( (float) $amount > $remaining ) {
 			throw new Exception( sprintf( 'Refund amount %s exceeds remaining refundable total %s', $amount, $remaining ) );
 		}
@@ -1452,6 +1543,14 @@ class Felix_Command_Handlers {
 			throw new Exception( 'create_order requires lineItems' );
 		}
 
+		// Arg-validation: a negative priceOverride would invert a line total,
+		// so reject any negative value up front — before any order is created.
+		foreach ( $line_items as $li ) {
+			if ( array_key_exists( 'priceOverride', $li ) && (float) $li['priceOverride'] < 0 ) {
+				throw new Exception( sprintf( 'priceOverride must be greater than or equal to zero (productId %s got %s)', $li['productId'] ?? '', $li['priceOverride'] ) );
+			}
+		}
+
 		// Resolve customer.
 		$customer_id = $args['customerId'] ?? null;
 		$email       = $args['email'] ?? null;
@@ -1496,28 +1595,47 @@ class Felix_Command_Handlers {
 		// Zero-price (comp-order) overrides applied AFTER calculate_totals so
 		// the override survives (calculate would otherwise re-price from the
 		// catalog). The order total is recomputed from the overridden lines.
-		$items = $order->get_items();
-		$keys  = array_keys( $items );
-		$idx   = 0;
+		//
+		// Overrides are correlated to order items by productId, NOT by line
+		// position: the created order's item ordering need not match the input
+		// lineItems ordering, so positional matching could re-price the wrong
+		// line. Index items by productId and throw if an override is ambiguous
+		// (two order items share the productId) or unmatched (no item carries
+		// that productId).
+		$items      = $order->get_items();
+		$by_product = array();
+		foreach ( $items as $item ) {
+			$pid = method_exists( $item, 'get_product_id' ) ? $item->get_product_id() : null;
+			if ( ! isset( $by_product[ $pid ] ) ) {
+				$by_product[ $pid ] = array();
+			}
+			$by_product[ $pid ][] = $item;
+		}
+
 		$recalc = false;
 		foreach ( $line_items as $li ) {
-			if ( array_key_exists( 'priceOverride', $li ) ) {
-				$item = isset( $keys[ $idx ] ) ? $items[ $keys[ $idx ] ] : null;
-				if ( $item ) {
-					$override_total = (float) $li['priceOverride'] * (int) ( $item->get_quantity() ? $item->get_quantity() : ( $li['quantity'] ?? 1 ) );
-					if ( method_exists( $item, 'set_subtotal' ) ) {
-						$item->set_subtotal( $override_total );
-					}
-					if ( method_exists( $item, 'set_total' ) ) {
-						$item->set_total( $override_total );
-					}
-					if ( method_exists( $item, 'save' ) ) {
-						$item->save();
-					}
-					$recalc = true;
-				}
+			if ( ! array_key_exists( 'priceOverride', $li ) ) {
+				continue;
 			}
-			$idx++;
+			$pid = $li['productId'] ?? null;
+			if ( ! isset( $by_product[ $pid ] ) ) {
+				throw new Exception( sprintf( 'priceOverride for productId %s does not match any order line', $pid ) );
+			}
+			if ( count( $by_product[ $pid ] ) > 1 ) {
+				throw new Exception( sprintf( 'priceOverride for productId %s is ambiguous (%d order lines share it)', $pid, count( $by_product[ $pid ] ) ) );
+			}
+			$item           = $by_product[ $pid ][0];
+			$override_total = (float) $li['priceOverride'] * (int) ( $item->get_quantity() ? $item->get_quantity() : ( $li['quantity'] ?? 1 ) );
+			if ( method_exists( $item, 'set_subtotal' ) ) {
+				$item->set_subtotal( $override_total );
+			}
+			if ( method_exists( $item, 'set_total' ) ) {
+				$item->set_total( $override_total );
+			}
+			if ( method_exists( $item, 'save' ) ) {
+				$item->save();
+			}
+			$recalc = true;
 		}
 
 		if ( $recalc ) {
@@ -1600,12 +1718,16 @@ class Felix_Command_Handlers {
 			throw new Exception( 'Customer not found' );
 		}
 
-		// Role enforcement: only the customer role may be deleted.
-		$roles       = isset( $user->roles ) ? (array) $user->roles : array();
-		$is_customer = in_array( 'customer', $roles, true );
-		if ( ! $is_customer ) {
+		// Role enforcement: a deletable user must hold the customer role —
+		// AND ONLY that role. WooCommerce adds the customer role to
+		// administrators who place orders, so a mere membership check
+		// (in_array) would let a multi-role admin (customer+administrator)
+		// through. Require customer to be the ONLY role, and surface the
+		// actual roles on refusal so the operator can see what blocked it.
+		$roles = isset( $user->roles ) ? array_values( (array) $user->roles ) : array();
+		if ( array( 'customer' ) !== $roles ) {
 			$role_label = ! empty( $roles ) ? implode( ',', $roles ) : 'unknown';
-			throw new Exception( sprintf( 'Refusing to delete non-customer user (role: %s)', $role_label ) );
+			throw new Exception( sprintf( 'Refusing to delete non-customer user (roles: %s)', $role_label ) );
 		}
 
 		if ( ! function_exists( 'wp_delete_user' ) ) {

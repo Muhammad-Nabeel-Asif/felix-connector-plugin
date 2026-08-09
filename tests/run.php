@@ -1059,6 +1059,18 @@ function test_refund_create() {
 	// Unknown order.
 	$r5 = exec_write( 'refund.create', array( 'orderId' => 999999, 'amount' => 5 ) );
 	expect_eq( 'unknown order => failed', $r5['status'], 'failed' );
+
+	// P2-1: zero/negative amount rejected explicitly BEFORE the over-refund
+	// check — a negative amount never satisfies `> remaining`, so without
+	// this guard it would bypass the upper bound and reach wc_create_refund.
+	$oid2 = seed_order( array( 'total' => 100.0 ) );
+	$r6 = exec_write( 'refund.create', array( 'orderId' => $oid2, 'amount' => 0 ) );
+	expect_eq( 'zero amount => failed', $r6['status'], 'failed' );
+	expect( 'zero amount message names zero', false !== strpos( $r6['error']['message'], 'zero' ) );
+
+	$r7 = exec_write( 'refund.create', array( 'orderId' => $oid2, 'amount' => -25 ) );
+	expect_eq( 'negative amount => failed', $r7['status'], 'failed' );
+	expect( 'negative amount message names zero', false !== strpos( $r7['error']['message'], 'zero' ) );
 }
 
 /**
@@ -1218,6 +1230,67 @@ function test_register_webhooks() {
 	// Validation: missing topics.
 	$r4 = exec_write( 'register_webhooks', array( 'deliveryUrl' => 'https://x.example.com/hook' ) );
 	expect_eq( 'missing topics => failed', $r4['status'], 'failed' );
+
+	// P2-2: deliveryUrl is validated — scheme MUST be https, and the host
+	// MUST NOT be localhost or a private/reserved IP range (SSRF guard for the
+	// target the store will POST to).
+
+	// Non-https scheme rejected.
+	$http = exec_write( 'register_webhooks', array(
+		'deliveryUrl' => 'http://felix.example.com/hook',
+		'secret'      => 's',
+		'topics'      => array( 'order.created' ),
+	) );
+	expect_eq( 'http deliveryUrl => failed', $http['status'], 'failed' );
+	expect( 'http refusal names https', false !== strpos( $http['error']['message'], 'https' ) );
+
+	// Private IPv4 ranges rejected.
+	$priv = exec_write( 'register_webhooks', array(
+		'deliveryUrl' => 'https://10.0.0.5/hook',
+		'secret'      => 's',
+		'topics'      => array( 'order.created' ),
+	) );
+	expect_eq( 'private 10/8 deliveryUrl => failed', $priv['status'], 'failed' );
+	expect( 'private refusal names private', false !== strpos( $priv['error']['message'], 'private' ) );
+
+	$cg = exec_write( 'register_webhooks', array(
+		'deliveryUrl' => 'https://192.168.1.1/hook',
+		'secret'      => 's',
+		'topics'      => array( 'order.created' ),
+	) );
+	expect_eq( 'private 192.168/16 deliveryUrl => failed', $cg['status'], 'failed' );
+
+	// Loopback (127/8 IPv4, ::1 IPv6) rejected.
+	$loop = exec_write( 'register_webhooks', array(
+		'deliveryUrl' => 'https://127.0.0.1/hook',
+		'secret'      => 's',
+		'topics'      => array( 'order.created' ),
+	) );
+	expect_eq( 'loopback IPv4 deliveryUrl => failed', $loop['status'], 'failed' );
+
+	$v6 = exec_write( 'register_webhooks', array(
+		'deliveryUrl' => 'https://[::1]/hook',
+		'secret'      => 's',
+		'topics'      => array( 'order.created' ),
+	) );
+	expect_eq( 'loopback IPv6 deliveryUrl => failed', $v6['status'], 'failed' );
+
+	// 'localhost' host rejected.
+	$lh = exec_write( 'register_webhooks', array(
+		'deliveryUrl' => 'https://localhost/hook',
+		'secret'      => 's',
+		'topics'      => array( 'order.created' ),
+	) );
+	expect_eq( 'localhost deliveryUrl => failed', $lh['status'], 'failed' );
+
+	// A public https named host is accepted (positive control).
+	$ok = exec_write( 'register_webhooks', array(
+		'deliveryUrl' => 'https://hooks.felix.app/inbox',
+		'secret'      => 's',
+		'topics'      => array( 'order.created' ),
+	) );
+	expect_eq( 'public https deliveryUrl => done', $ok['status'], 'done' );
+	expect_eq( 'public https registers the topic', count( $ok['result']['registered'] ), 1 );
 }
 
 /**
@@ -1319,6 +1392,52 @@ function test_create_order() {
 	// Unknown product id.
 	$r4 = exec_write( 'create_order', array( 'lineItems' => array( array( 'productId' => 999999, 'quantity' => 1 ) ) ) );
 	expect_eq( 'unknown product => failed', $r4['status'], 'failed' );
+
+	// P1-2: a negative priceOverride is rejected at arg-validation time (no
+	// order is created), so it can never invert a line total.
+	$r5 = exec_write( 'create_order', array(
+		'lineItems' => array(
+			array( 'productId' => $p1, 'quantity' => 1, 'priceOverride' => -5 ),
+		),
+	) );
+	expect_eq( 'negative priceOverride => failed', $r5['status'], 'failed' );
+	expect( 'negative override message names priceOverride', false !== strpos( $r5['error']['message'], 'priceOverride' ) );
+
+	// P2-3: overrides correlate to order lines by productId, NOT by line
+	// position. Three products; override only the MIDDLE one and confirm that
+	// the middle line is re-priced while the outer lines keep their catalog
+	// totals (positional matching on a reordered order would mis-apply).
+	$pa = seed_product( array( 'price' => '3.00', 'name' => 'Alpha' ) );
+	$pb = seed_product( array( 'price' => '7.00', 'name' => 'Bravo' ) );
+	$pc = seed_product( array( 'price' => '11.00', 'name' => 'Charlie' ) );
+	$r6 = exec_write( 'create_order', array(
+		'lineItems' => array(
+			array( 'productId' => $pa, 'quantity' => 1 ),
+			array( 'productId' => $pb, 'quantity' => 2, 'priceOverride' => 4 ),
+			array( 'productId' => $pc, 'quantity' => 1 ),
+		),
+	) );
+	expect_eq( 'productId-keyed override => done', $r6['status'], 'done' );
+	$by_pid = array();
+	foreach ( $r6['result']['order']['lineItems'] as $ln ) {
+		$by_pid[ $ln['productId'] ] = (float) $ln['total'];
+	}
+	expect_eq( 'middle (pb) line overridden to 2*4', $by_pid[ $pb ], 8.0 );
+	expect_eq( 'first (pa) line untouched at catalog', $by_pid[ $pa ], 3.0 );
+	expect_eq( 'last (pc) line untouched at catalog', $by_pid[ $pc ], 11.0 );
+	expect_eq( 'order total reflects single targeted override', $r6['result']['order']['total'], 3.0 + 8.0 + 11.0 );
+
+	// P2-3: an ambiguous override (two input lines sharing the same productId
+	// produce two order lines with that productId) is rejected — it is never
+	// silently applied to just one of the colliding lines.
+	$r7 = exec_write( 'create_order', array(
+		'lineItems' => array(
+			array( 'productId' => $p1, 'quantity' => 1, 'priceOverride' => 2 ),
+			array( 'productId' => $p1, 'quantity' => 2 ),
+		),
+	) );
+	expect_eq( 'ambiguous productId override => failed', $r7['status'], 'failed' );
+	expect( 'ambiguous override message names ambiguous', false !== strpos( $r7['error']['message'], 'ambiguous' ) );
 }
 
 /**
@@ -1351,6 +1470,17 @@ function test_delete_customer() {
 	$r3 = exec_write( 'delete_customer', array( 'email' => 'mgr@example.com' ) );
 	expect_eq( 'shop_manager deletion refused => failed', $r3['status'], 'failed' );
 	expect( 'shop_manager still present', isset( $GLOBALS['__felix_users'][ $mgr ] ) );
+
+	// P1-1: a multi-role user holding BOTH customer AND administrator must be
+	// refused. WooCommerce adds the customer role to admins who place orders,
+	// so a mere membership check (in_array) would let them through. Customer
+	// must be the ONLY role, and the refusal must name the actual roles.
+	$multi = seed_user( array( 'user_email' => 'multi@example.com', 'roles' => array( 'administrator', 'customer' ) ) );
+	$r7 = exec_write( 'delete_customer', array( 'customerId' => $multi ) );
+	expect_eq( 'multi-role admin refused => failed', $r7['status'], 'failed' );
+	expect( 'refusal names administrator role', false !== strpos( $r7['error']['message'], 'administrator' ) );
+	expect( 'refusal names customer role', false !== strpos( $r7['error']['message'], 'customer' ) );
+	expect( 'multi-role user still present (not deleted)', isset( $GLOBALS['__felix_users'][ $multi ] ) );
 
 	// Resolve-by-email happy path.
 	$cust2 = seed_user( array( 'user_email' => 'cust2@example.com', 'roles' => array( 'customer' ) ) );
