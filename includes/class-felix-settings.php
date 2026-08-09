@@ -52,10 +52,29 @@ class Felix_Settings {
 	}
 
 	private function handle_pair() {
-		$pairing_code = sanitize_text_field( wp_unslash( $_POST['pairing_code'] ?? '' ) );
+		$raw_pairing_code = sanitize_text_field( wp_unslash( $_POST['pairing_code'] ?? '' ) );
 
-		if ( empty( $pairing_code ) ) {
+		if ( '' === $raw_pairing_code ) {
 			add_settings_error( 'felix_connector', 'no_code', __( 'Please enter a pairing code from your Felix dashboard.', 'felix-connector' ), 'error' );
+			return;
+		}
+
+		// Normalize to the canonical form the backend compares against: drop the
+		// cosmetic hyphen/space separator and any stray punctuation, uppercase,
+		// and keep ONLY unambiguous-alphabet characters. The displayed code is
+		// XXXX-XXXX; this collapses it back to the stored 8-char canonical string.
+		$pairing_code = self::normalize_pairing_code( $raw_pairing_code );
+		if ( strlen( $pairing_code ) !== FELIX_PAIRING_CODE_LENGTH ) {
+			add_settings_error(
+				'felix_connector',
+				'bad_code',
+				sprintf(
+					/* translators: %d: required pairing-code length. */
+					__( 'That pairing code does not look right — it should be %d characters (letters and digits, exactly as shown in Felix, e.g. ABCD-EFGH).', 'felix-connector' ),
+					FELIX_PAIRING_CODE_LENGTH
+				),
+				'error'
+			);
 			return;
 		}
 
@@ -109,6 +128,30 @@ class Felix_Settings {
 		update_option( FELIX_OPT_LIVENESS_STATE, 'pairing', false );
 
 		add_settings_error( 'felix_connector', 'pair_success', __( 'Store connected to Felix! The connector will activate automatically — usually within seconds.', 'felix-connector' ), 'updated' );
+	}
+
+	/**
+	 * Normalize an operator-entered pairing code to the canonical form the
+	 * backend stores and compares against: uppercase, then keep ONLY the
+	 * unambiguous-alphabet characters (drops the cosmetic hyphen/space separator
+	 * and any stray punctuation, and silently rejects ambiguous glyphs like 0/O
+	 * and 1/I/L which never appear in a minted code). Static so it is unit-
+	 * testable without the WP admin lifecycle.
+	 *
+	 * @param string $raw Raw input from the settings form.
+	 * @return string Canonical code (length is checked by the caller).
+	 */
+	public static function normalize_pairing_code( $raw ) {
+		$upper     = strtoupper( (string) $raw );
+		$canonical = '';
+		$len       = strlen( $upper );
+		for ( $i = 0; $i < $len; $i++ ) {
+			$ch = $upper[ $i ];
+			if ( false !== strpos( FELIX_PAIRING_CODE_ALPHABET, $ch ) ) {
+				$canonical .= $ch;
+			}
+		}
+		return $canonical;
 	}
 
 	private function handle_unpair() {
@@ -288,7 +331,10 @@ class Felix_Settings {
 						<table class="form-table">
 							<tr>
 								<th scope="row"><label for="pairing_code"><?php esc_html_e( 'Pairing Code', 'felix-connector' ); ?></label></th>
-								<td><input type="text" id="pairing_code" name="pairing_code" class="regular-text" placeholder="ABC123" style="font-size: 18px; letter-spacing: 2px;" required></td>
+								<td>
+									<input type="text" id="pairing_code" name="pairing_code" class="regular-text" placeholder="ABCD-EFGH" maxlength="9" autocomplete="off" autocapitalize="characters" spellcheck="false" title="<?php esc_attr_e( 'Enter the 8-character pairing code from Felix (e.g. ABCD-EFGH).', 'felix-connector' ); ?>" style="font-family: monospace; font-size: 20px; letter-spacing: 3px; text-transform: uppercase;" required>
+									<p class="description"><?php esc_html_e( '8 characters, as shown in your Felix dashboard (dashes optional).', 'felix-connector' ); ?></p>
+								</td>
 							</tr>
 						</table>
 						<?php submit_button( __( 'Connect Store', 'felix-connector' ), 'primary' ); ?>

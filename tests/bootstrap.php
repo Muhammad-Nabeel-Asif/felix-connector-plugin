@@ -47,6 +47,14 @@ if ( ! defined( 'FELIX_PROTOCOL_VERSION' ) ) {
 	define( 'FELIX_PROTOCOL_VERSION', 2 );
 }
 
+// Mirror felix-connector.php pairing-code format constants.
+if ( ! defined( 'FELIX_PAIRING_CODE_LENGTH' ) ) {
+	define( 'FELIX_PAIRING_CODE_LENGTH', 8 );
+}
+if ( ! defined( 'FELIX_PAIRING_CODE_ALPHABET' ) ) {
+	define( 'FELIX_PAIRING_CODE_ALPHABET', 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789' );
+}
+
 // --- Global mutable test state ----------------------------------------------
 $GLOBALS['__felix_options']      = array();
 $GLOBALS['__felix_handler_calls'] = 0;
@@ -332,6 +340,7 @@ $GLOBALS['wpdb'] = new FakeWPDB();
 // --- Load the plugin classes under test --------------------------------------
 require_once FELIX_CONNECTOR_PLUGIN_DIR . 'includes/class-felix-crypto.php';
 require_once FELIX_CONNECTOR_PLUGIN_DIR . 'includes/class-felix-pairing.php';
+require_once FELIX_CONNECTOR_PLUGIN_DIR . 'includes/class-felix-settings.php';
 require_once FELIX_CONNECTOR_PLUGIN_DIR . 'includes/class-felix-command-ledger.php';
 require_once FELIX_CONNECTOR_PLUGIN_DIR . 'includes/class-felix-command-handlers.php';
 require_once FELIX_CONNECTOR_PLUGIN_DIR . 'includes/class-felix-command-processor.php';

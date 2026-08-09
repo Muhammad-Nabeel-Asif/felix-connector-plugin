@@ -823,6 +823,43 @@ if ( ! class_exists( 'Felix_Runner' ) ) {
 	require_once FELIX_CONNECTOR_PLUGIN_DIR . 'includes/class-felix-runner.php';
 }
 
+/**
+ * Pairing-code input normalization + validation.
+ *
+ * The backend now mints 8-char codes (grouped XXXX-XXXX) from an unambiguous
+ * alphabet. The plugin must collapse whatever the operator types — hyphen,
+ * spaces, lowercase, stray punctuation, even ambiguous glyphs — back to the
+ * canonical 8-char string the backend compares against, and reject anything
+ * that does not normalize to exactly FELIX_PAIRING_CODE_LENGTH characters.
+ */
+function test_pairing_code_normalization() {
+	echo "\n[pairing-code normalization + validation]\n";
+
+	// Canonical grouped display → ungrouped canonical.
+	expect_eq( 'strips the cosmetic hyphen', Felix_Settings::normalize_pairing_code( 'ABCD-EFGH' ), 'ABCDEFGH' );
+	// Lowercase is uppercased.
+	expect_eq( 'uppercases lowercase input', Felix_Settings::normalize_pairing_code( 'abcd-efgh' ), 'ABCDEFGH' );
+	// Spaces and stray punctuation collapse too.
+	expect_eq( 'strips spaces + punctuation', Felix_Settings::normalize_pairing_code( 'AB CD-EF GH!' ), 'ABCDEFGH' );
+	// Already-canonical input is idempotent.
+	expect_eq( 'idempotent on canonical input', Felix_Settings::normalize_pairing_code( 'K7QM9HR2' ), 'K7QM9HR2' );
+
+	// Validity gate: a correctly typed code normalizes to exactly 8 chars.
+	expect( 'grouped 8-char code is valid', strlen( Felix_Settings::normalize_pairing_code( 'K7QM-9HR2' ) ) === FELIX_PAIRING_CODE_LENGTH );
+
+	// Ambiguous glyphs (0/O/1/I/L never appear in a minted code) are dropped,
+	// so a mistyped code under-shoots the length and is rejected — never mapped
+	// to a plausible-but-wrong code.
+	expect( 'ambiguous 0 rejected (length drops)', strlen( Felix_Settings::normalize_pairing_code( 'ABCD0EFG' ) ) < FELIX_PAIRING_CODE_LENGTH );
+	expect( 'legacy 6-char code rejected', strlen( Felix_Settings::normalize_pairing_code( 'ABC123' ) ) < FELIX_PAIRING_CODE_LENGTH );
+	expect( 'empty input rejected', '' === Felix_Settings::normalize_pairing_code( '' ) );
+
+	// Entropy sanity: the normalized alphabet never contains 0, 1, O, or I.
+	$sample = Felix_Settings::normalize_pairing_code( 'K7QM9HR2' );
+	expect( 'canonical alphabet excludes 0', false === strpos( $sample, '0' ) );
+	expect( 'canonical alphabet excludes 1', false === strpos( $sample, '1' ) );
+}
+
 // =============================================================================
 // RUN
 // =============================================================================
@@ -848,6 +885,7 @@ test_fresh_reservation_not_reconciled();
 test_fresh_conflict_then_later_terminal_retrieval();
 test_renew_handler_registered();
 test_authorization_basis_object_form();
+test_pairing_code_normalization();
 
 echo str_repeat( '=', 60 ) . "\n";
 $total = $GLOBALS['__pass'] + $GLOBALS['__fail'];

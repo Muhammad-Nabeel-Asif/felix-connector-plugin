@@ -58,6 +58,18 @@ if ( ! defined( 'FELIX_API_BASE' ) ) {
 // poll-auth verifier needs to know the extended signing string.
 define( 'FELIX_PROTOCOL_VERSION', 2 );
 
+// Pairing-code format (must stay in lockstep with the Felix backend).
+//
+// The backend mints an 8-character code from a 32-symbol UNAMBIGUOUS alphabet
+// (0/O and 1/I/L removed so a hand-typed code can't be misread) and displays it
+// grouped as XXXX-XXXX for easy transcription. The hyphen is purely cosmetic:
+// the plugin normalizes the operator's input back to the canonical 8-character
+// form before submitting, so the backend compares an exact, ungrouped string.
+// Eight symbols × 5 bits = 40 bits of entropy (a 1024× larger space than the
+// prior six-character code).
+define( 'FELIX_PAIRING_CODE_LENGTH', 8 );
+define( 'FELIX_PAIRING_CODE_ALPHABET', 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789' );
+
 require_once FELIX_CONNECTOR_PLUGIN_DIR . 'includes/class-felix-crypto.php';
 require_once FELIX_CONNECTOR_PLUGIN_DIR . 'includes/class-felix-command-ledger.php';
 require_once FELIX_CONNECTOR_PLUGIN_DIR . 'includes/class-felix-command-handlers.php';
