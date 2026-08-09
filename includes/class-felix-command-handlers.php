@@ -363,6 +363,55 @@ class Felix_Command_Handlers {
 	}
 
 	/**
+	 * IPv4 reserved/private range check over a 4-byte (inet_pton) packed form.
+	 *
+	 * Shared by the native IPv4 path AND the IPv4-mapped IPv6 path so an
+	 * attacker cannot bypass the SSRF guard by rewriting a private IPv4 as
+	 * ::ffff:a.b.c.d. Returns true when the address must not be targeted.
+	 *
+	 * @param string $packed Exactly 4 bytes.
+	 * @return bool
+	 */
+	private function is_private_ipv4_packed( $packed ) {
+		$b0 = ord( $packed[0] );
+		$b1 = ord( $packed[1] );
+
+		// 0.0.0.0/8 ("this network") — includes 0.0.0.0.
+		if ( 0 === $b0 ) {
+			return true;
+		}
+		// 10.0.0.0/8 (private).
+		if ( 10 === $b0 ) {
+			return true;
+		}
+		// 100.64.0.0/10 (CGNAT / shared address space).
+		if ( 100 === $b0 && $b1 >= 64 && $b1 <= 127 ) {
+			return true;
+		}
+		// 127.0.0.0/8 (loopback).
+		if ( 127 === $b0 ) {
+			return true;
+		}
+		// 169.254.0.0/16 (link-local).
+		if ( 169 === $b0 && 254 === $b1 ) {
+			return true;
+		}
+		// 172.16.0.0/12 (private).
+		if ( 172 === $b0 && $b1 >= 16 && $b1 <= 31 ) {
+			return true;
+		}
+		// 192.168.0.0/16 (private).
+		if ( 192 === $b0 && 168 === $b1 ) {
+			return true;
+		}
+		// 240.0.0.0/4 (reserved) — includes the 255.255.255.255 broadcast.
+		if ( $b0 >= 240 ) {
+			return true;
+		}
+		return false;
+	}
+
+	/**
 	 * Validate a webhook delivery URL is a safe target for the store to POST
 	 * to: the scheme MUST be https, the host MUST NOT be 'localhost', and an
 	 * IP-literal host MUST NOT fall in a private or reserved range (SSRF guard
@@ -406,28 +455,17 @@ class Felix_Command_Handlers {
 
 		$private = false;
 		if ( false !== $is_v4 && 4 === strlen( $packed ) ) {
-			$b0 = ord( $packed[0] );
-			$b1 = ord( $packed[1] );
-			// 10.0.0.0/8
-			if ( 10 === $b0 ) {
-				$private = true;
-			} elseif ( 172 === $b0 && $b1 >= 16 && $b1 <= 31 ) {
-				// 172.16.0.0/12
-				$private = true;
-			} elseif ( 192 === $b0 && 168 === $b1 ) {
-				// 192.168.0.0/16
-				$private = true;
-			} elseif ( 127 === $b0 ) {
-				// 127.0.0.0/8 (loopback)
-				$private = true;
-			} elseif ( 169 === $b0 && 254 === $b1 ) {
-				// 169.254.0.0/16 (link-local)
-				$private = true;
-			}
+			$private = $this->is_private_ipv4_packed( $packed );
 		} elseif ( false !== $is_v6 && 16 === strlen( $packed ) ) {
 			// ::1 (loopback).
 			if ( "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01" === $packed ) {
 				$private = true;
+			} elseif ( "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff" === substr( $packed, 0, 12 ) ) {
+				// IPv4-mapped IPv6 (::ffff:a.b.c.d): re-validate the embedded
+				// IPv4 (last 4 bytes) through the SAME reserved-range checks as
+				// a native IPv4 literal, so the SSRF guard cannot be bypassed
+				// by expressing a private IPv4 in its mapped form.
+				$private = $this->is_private_ipv4_packed( substr( $packed, 12, 4 ) );
 			} else {
 				// fc00::/7 — unique-local. Top 7 bits 1111110 => first byte 0xFC|0xFD.
 				$b0 = ord( $packed[0] );
@@ -1599,17 +1637,27 @@ class Felix_Command_Handlers {
 		// Overrides are correlated to order items by productId, NOT by line
 		// position: the created order's item ordering need not match the input
 		// lineItems ordering, so positional matching could re-price the wrong
-		// line. Index items by productId and throw if an override is ambiguous
-		// (two order items share the productId) or unmatched (no item carries
-		// that productId).
+		// line. Index each item by BOTH its parent product_id AND (when
+		// non-zero) its variation_id, so an override may target either id kind
+		// — a variation line item carries a parent id plus a variation id, and
+		// the connector may key the override by either. Throw if an override is
+		// ambiguous (>1 order item shares the id) or unmatched.
 		$items      = $order->get_items();
 		$by_product = array();
 		foreach ( $items as $item ) {
-			$pid = method_exists( $item, 'get_product_id' ) ? $item->get_product_id() : null;
-			if ( ! isset( $by_product[ $pid ] ) ) {
-				$by_product[ $pid ] = array();
+			$keys = array();
+			if ( method_exists( $item, 'get_product_id' ) ) {
+				$keys[] = $item->get_product_id();
 			}
-			$by_product[ $pid ][] = $item;
+			if ( method_exists( $item, 'get_variation_id' ) && $item->get_variation_id() ) {
+				$keys[] = $item->get_variation_id();
+			}
+			foreach ( $keys as $key ) {
+				if ( ! isset( $by_product[ $key ] ) ) {
+					$by_product[ $key ] = array();
+				}
+				$by_product[ $key ][] = $item;
+			}
 		}
 
 		$recalc = false;
@@ -1619,7 +1667,7 @@ class Felix_Command_Handlers {
 			}
 			$pid = $li['productId'] ?? null;
 			if ( ! isset( $by_product[ $pid ] ) ) {
-				throw new Exception( sprintf( 'priceOverride for productId %s does not match any order line', $pid ) );
+				throw new Exception( sprintf( 'priceOverride for productId %s does not match any order line productId or variationId', $pid ) );
 			}
 			if ( count( $by_product[ $pid ] ) > 1 ) {
 				throw new Exception( sprintf( 'priceOverride for productId %s is ambiguous (%d order lines share it)', $pid, count( $by_product[ $pid ] ) ) );

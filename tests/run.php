@@ -892,6 +892,36 @@ function seed_product( $overrides = array() ) {
 }
 
 /**
+ * Seed a variation product under a parent (variable) product. The variation
+ * carries type='variation' and a non-zero parentId so WC_Order::add_product()
+ * records product_id=parent + variation_id=variation (mirrors WooCommerce).
+ * Returns the variation id.
+ */
+function seed_variation( $parent_id, $overrides = array() ) {
+	$id = ++$GLOBALS['__felix_next_id']['product'];
+	$GLOBALS['__felix_products_meta'][ $id ] = array_merge(
+		array(
+			'name'            => 'Variation ' . $id,
+			'slug'            => 'variation-' . $id,
+			'status'          => 'publish',
+			'type'            => 'variation',
+			'parentId'        => (int) $parent_id,
+			'price'           => '12.00',
+			'regularPrice'    => '12.00',
+			'salePrice'       => '',
+			'sku'             => 'VAR-' . $id,
+			'manageStock'     => true,
+			'stockStatus'     => 'instock',
+			'stockQuantity'   => 50,
+			'description'     => 'A variation.',
+			'shortDescription'=> 'Variation.',
+		),
+		$overrides
+	);
+	return $id;
+}
+
+/**
  * Seed a coupon AND its shop_coupon CPT post (the CPT powers list/sync via
  * WP_Query). Returns the coupon id.
  */
@@ -1283,6 +1313,50 @@ function test_register_webhooks() {
 	) );
 	expect_eq( 'localhost deliveryUrl => failed', $lh['status'], 'failed' );
 
+	// P2-A: additional SSRF ranges rejected — 0.0.0.0/8 ("this network"),
+	// 100.64.0.0/10 (CGNAT), and 240.0.0.0/4 reserved (covers the
+	// 255.255.255.255 broadcast).
+	$zero = exec_write( 'register_webhooks', array(
+		'deliveryUrl' => 'https://0.0.0.0/hook',
+		'secret'      => 's',
+		'topics'      => array( 'order.created' ),
+	) );
+	expect_eq( '0.0.0.0/8 deliveryUrl => failed', $zero['status'], 'failed' );
+
+	$cgnat = exec_write( 'register_webhooks', array(
+		'deliveryUrl' => 'https://100.64.0.1/hook',
+		'secret'      => 's',
+		'topics'      => array( 'order.created' ),
+	) );
+	expect_eq( 'CGNAT 100.64/10 deliveryUrl => failed', $cgnat['status'], 'failed' );
+
+	$bcast = exec_write( 'register_webhooks', array(
+		'deliveryUrl' => 'https://255.255.255.255/hook',
+		'secret'      => 's',
+		'topics'      => array( 'order.created' ),
+	) );
+	expect_eq( 'broadcast 255.255.255.255 deliveryUrl => failed', $bcast['status'], 'failed' );
+
+	// P2-A: IPv4-mapped IPv6 — a private IPv4 expressed as ::ffff:a.b.c.d
+	// must NOT bypass the SSRF guard (the embedded IPv4 is re-validated).
+	$mapped_priv = exec_write( 'register_webhooks', array(
+		'deliveryUrl' => 'https://[::ffff:10.0.0.1]/hook',
+		'secret'      => 's',
+		'topics'      => array( 'order.created' ),
+	) );
+	expect_eq( 'mapped private ::ffff:10.0.0.1 => failed', $mapped_priv['status'], 'failed' );
+	expect( 'mapped private refusal names private', false !== strpos( $mapped_priv['error']['message'], 'private' ) );
+
+	// A PUBLIC IPv4-mapped IPv6 is accepted (positive control: the mapped
+	// prefix itself is never blocked, only its embedded private ranges).
+	$mapped_pub = exec_write( 'register_webhooks', array(
+		'deliveryUrl' => 'https://[::ffff:8.8.8.8]/hook',
+		'secret'      => 's',
+		'topics'      => array( 'order.created' ),
+	) );
+	expect_eq( 'mapped public ::ffff:8.8.8.8 => done', $mapped_pub['status'], 'done' );
+	expect_eq( 'mapped public registers the topic', count( $mapped_pub['result']['registered'] ), 1 );
+
 	// A public https named host is accepted (positive control).
 	$ok = exec_write( 'register_webhooks', array(
 		'deliveryUrl' => 'https://hooks.felix.app/inbox',
@@ -1438,6 +1512,73 @@ function test_create_order() {
 	) );
 	expect_eq( 'ambiguous productId override => failed', $r7['status'], 'failed' );
 	expect( 'ambiguous override message names ambiguous', false !== strpos( $r7['error']['message'], 'ambiguous' ) );
+}
+
+/**
+ * create_order — P2-B: variation-product priceOverride correlation. A
+ * variation line item carries a parent product_id AND a non-zero variation_id;
+ * the correlation map indexes BOTH, so an override may target either id kind.
+ * The existing product_id path is unaffected (no regression).
+ */
+function test_create_order_variation_override() {
+	echo "\n[create_order — variation priceOverride correlation (P2-B)]\n";
+	reset_state();
+
+	// A variable parent with two variations.
+	$parent = seed_product( array( 'name' => 'Tee', 'price' => '20.00', 'type' => 'variable' ) );
+	$vred   = seed_variation( $parent, array( 'name' => 'Tee - Red', 'price' => '18.00' ) );
+	$vblue  = seed_variation( $parent, array( 'name' => 'Tee - Blue', 'price' => '22.00' ) );
+
+	// Override keyed by the VARIATION id resolves to the variation line.
+	// Previously this threw "no match": the order item was indexed only by
+	// its parent product_id, so a variation-id override found nothing.
+	$r = exec_write( 'create_order', array(
+		'lineItems' => array(
+			array( 'productId' => $vred, 'quantity' => 2, 'priceOverride' => 5 ),
+		),
+	) );
+	expect_eq( 'variation override => done', $r['status'], 'done' );
+	expect_eq( 'variation line overridden 2*5', $r['result']['order']['lineItems'][0]['total'], 10.0 );
+	expect_eq( 'variation order total = 10', $r['result']['order']['total'], 10.0 );
+
+	// Two variations of the SAME parent in one order: each item is indexed
+	// under its own variation_id AND the shared parent product_id. An
+	// override keyed by a variation_id is unambiguous (targets that line
+	// only); the sibling line keeps its catalog price.
+	$r2 = exec_write( 'create_order', array(
+		'lineItems' => array(
+			array( 'productId' => $vred, 'quantity' => 1 ),
+			array( 'productId' => $vblue, 'quantity' => 1, 'priceOverride' => 0 ),
+		),
+	) );
+	expect_eq( 'sibling-variation override => done', $r2['status'], 'done' );
+	expect_eq( 'first variation line (vred) at catalog 18', $r2['result']['order']['lineItems'][0]['total'], 18.0 );
+	expect_eq( 'second variation line (vblue) overridden to 0', $r2['result']['order']['lineItems'][1]['total'], 0.0 );
+	expect_eq( 'sibling-variation order total = 18', $r2['result']['order']['total'], 18.0 );
+
+	// Two order lines sharing the SAME variation id make an override keyed by
+	// that variation id ambiguous — the (>1 match) guard fires through the
+	// variation_id key, not just the product_id key.
+	$r3 = exec_write( 'create_order', array(
+		'lineItems' => array(
+			array( 'productId' => $vred, 'quantity' => 1, 'priceOverride' => 2 ),
+			array( 'productId' => $vred, 'quantity' => 2 ),
+		),
+	) );
+	expect_eq( 'ambiguous variation-id override => failed', $r3['status'], 'failed' );
+	expect( 'ambiguous variation override names ambiguous', false !== strpos( $r3['error']['message'], 'ambiguous' ) );
+
+	// Parent (simple) product override still resolves — no regression in the
+	// product_id-keyed path.
+	$mug = seed_product( array( 'name' => 'Mug', 'price' => '9.00' ) );
+	$r4 = exec_write( 'create_order', array(
+		'lineItems' => array(
+			array( 'productId' => $mug, 'quantity' => 3, 'priceOverride' => 2 ),
+		),
+	) );
+	expect_eq( 'simple parent-id override => done', $r4['status'], 'done' );
+	expect_eq( 'simple line overridden 3*2', $r4['result']['order']['lineItems'][0]['total'], 6.0 );
+	expect_eq( 'simple order total = 6', $r4['result']['order']['total'], 6.0 );
 }
 
 /**
@@ -1601,6 +1742,7 @@ test_register_webhooks();
 test_verify_webhooks();
 test_remove_webhooks();
 test_create_order();
+test_create_order_variation_override();
 test_delete_customer();
 test_new_family_authorization_classification();
 

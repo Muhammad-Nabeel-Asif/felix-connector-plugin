@@ -558,20 +558,27 @@ function wc_get_webhooks( $args = array() ) {
 if ( ! class_exists( 'WC_Order_Item_Product' ) ) {
 	class WC_Order_Item_Product {
 		private $data = array(
-			'name'      => '',
-			'productId' => 0,
-			'quantity'  => 1,
-			'subtotal'  => 0,
-			'total'     => 0,
+			'name'        => '',
+			'productId'   => 0,
+			'variationId' => 0,
+			'quantity'    => 1,
+			'subtotal'    => 0,
+			'total'       => 0,
 		);
 		public function get_id() {
-			return 0;
+			return $this->id;
+		}
+		public function get_parent_id() {
+			return $this->data['parentId'] ?? 0;
 		}
 		public function get_name() {
 			return $this->data['name'];
 		}
 		public function get_product_id() {
 			return $this->data['productId'];
+		}
+		public function get_variation_id() {
+			return $this->data['variationId'];
 		}
 		public function get_quantity() {
 			return $this->data['quantity'];
@@ -584,6 +591,9 @@ if ( ! class_exists( 'WC_Order_Item_Product' ) ) {
 		}
 		public function set_product_id( $v ) {
 			$this->data['productId'] = $v;
+		}
+		public function set_variation_id( $v ) {
+			$this->data['variationId'] = $v;
 		}
 		public function set_quantity( $v ) {
 			$this->data['quantity'] = $v;
@@ -757,7 +767,16 @@ if ( ! class_exists( 'WC_Order' ) ) {
 		public function add_product( $product, $qty = 1 ) {
 			$item = new WC_Order_Item_Product();
 			$item->set_name( $product->get_name() );
-			$item->set_product_id( $product->get_id() );
+			// A variation carries its own id AND a parent product id: the order
+			// item records the PARENT as product_id and the variation as
+			// variation_id (mirrors WooCommerce). Simple products record only
+			// product_id (variation_id stays 0).
+			if ( method_exists( $product, 'get_parent_id' ) && $product->get_parent_id() ) {
+				$item->set_product_id( $product->get_parent_id() );
+				$item->set_variation_id( $product->get_id() );
+			} else {
+				$item->set_product_id( $product->get_id() );
+			}
 			$item->set_quantity( $qty );
 			$line = (float) $product->get_price() * $qty;
 			$item->set_subtotal( $line );
