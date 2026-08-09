@@ -1,0 +1,49 @@
+{
+  "contractVersion": 2,
+  "algorithm": "Ed25519",
+  "publicKeyB64": "lrlTB/QhhFTOX528D6hcYNMPQkkm2o1aDoWaGAWb7A0=",
+  "cases": [
+    {
+      "name": "empty_object",
+      "input": "{}",
+      "expected": "{}",
+      "signature": "Ax7S6IJesD0xRYQCL84C/PjAhgWAZS/wHTpVX+LPyhNWVO0ms6uX30jFq81ReRaiMI8HSbvS5uacX/NIv03OCw=="
+    },
+    {
+      "name": "empty_array",
+      "input": "[]",
+      "expected": "[]",
+      "signature": "YFuxrHYN3AqsYEarsJUWH+25ZtTk636CNFkeQGQYzKCbmEn49EE29S2CWKwjAokwqNphwpXKaFLVRDlqwn55Aw=="
+    },
+    {
+      "name": "object_with_empty_object_and_array",
+      "input": "{\"obj\":{},\"arr\":[]}",
+      "expected": "{\"arr\":[],\"obj\":{}}",
+      "signature": "nCCj3rTnUFq33cVm6dxhqwe0VtuycUPu0BebtFJM1fT/gkmeQE9Dsr2l0hp/gT7n4Av4Bv2M35EstSAJuW3VAA=="
+    },
+    {
+      "name": "integers",
+      "input": "{\"pos\":42,\"neg\":-7,\"zero\":0,\"big\":9007199254740992}",
+      "expected": "{\"big\":9007199254740992,\"neg\":-7,\"pos\":42,\"zero\":0}",
+      "signature": "vT9hf+3UCG/38YHmG/cejHzME37SgB5U58umamKXPEy6jhUsOy7exjl28T7o5gcC90upprzQnQrwjmnJLTwbBA=="
+    },
+    {
+      "name": "negative_and_zero",
+      "input": "{\"neg_float\":-3.14,\"zero\":0,\"neg_int\":-255,\"neg_one\":-1}",
+      "expected": "{\"neg_float\":-3.14,\"neg_int\":-255,\"neg_one\":-1,\"zero\":0}",
+      "signature": "RKQPRo2LRzHg31LqEiI/gcCsEhVhRE80xZKL1jvs5b2efhzjtvh+w6LawKKLuApDoYGkV7YSDIhKT/I8B+nmDA=="
+    },
+    {
+      "name": "exponent_floats",
+      "input": "{\"tiny\":1e-7,\"tiny2\":5e-8,\"frac\":1.5e-7,\"huge\":1e21,\"mid\":1e20,\"micro\":0.000001}",
+      "expected": "{\"frac\":1.5e-7,\"huge\":1e+21,\"micro\":0.000001,\"mid\":100000000000000000000,\"tiny\":1e-7,\"tiny2\":5e-8}",
+      "signature": "HstERjSM1DMzId0fGbPhvT56aYMhi2kZPW4lB3MuymY7IOEuYQXr0jz8qvzn9uGJqsbaAigrk9Qrdec/2B0qDw=="
+    },
+    {
+      "name": "nested_mixture",
+      "input": "{\"args\":{\"email\":\"José@example.com\",\"url\":\"https://shop.example.com/p\"},\"flags\":[3,1,2],\"meta\":{\"empty\":{},\"coeffs\":[1e-7,-3.14,42]},\"issuedAt\":\"2026-01-15T12:30:00.000Z\"}",
+      "expected": "{\"args\":{\"email\":\"Jos\\u00e9@example.com\",\"url\":\"https:\\/\\/shop.example.com\\/p\"},\"flags\":[3,1,2],\"issuedAt\":\"2026-01-15T12:30:00.000Z\",\"meta\":{\"coeffs\":[1e-7,-3.14,42],\"empty\":{}}}",
+      "signature": "Wwzms4I5oeKQpJgKVbqfQ9xgwc1UM6FcnjFVLBxe/hnmj82qEI6rhX9PdeBVnolEMdbD36a+nP2I6ITGJ5JRBg=="
+    }
+  ]
+}

@@ -6,11 +6,12 @@
  * keypair at activation. The private key never leaves the store. Felix stores
  * only the public key.
  *
- * Signing approach: the signature is computed over a canonical JSON string
- * with the "signature" field REMOVED entirely (not zeroed). This avoids
- * cross-language JSON canonicalization issues (null bytes, escaping order).
- * Both PHP and Node.js produce identical JSON when using json_encode /
- * JSON.stringify on an object without the signature field.
+ * Signing approach: the signature is computed over a recursive canonical JSON
+ * string (contract v2 — see CANONICAL_CONTRACT_VERSION) with the "signature"
+ * field REMOVED entirely (not zeroed). The canonical form is built
+ * byte-for-byte so PHP and Node.js agree across the known divergences: empty
+ * object {} vs empty array [], exponent float formatting (1e-7 not 1.0e-7),
+ * slash/unicode escaping, and key ordering. Non-finite numbers are rejected.
  *
  * @package FelixConnector
  */
@@ -113,19 +114,25 @@ class Felix_Crypto {
 	}
 
 	/**
+	 * Canonical JSON byte-contract version. MUST match the backend's
+	 * CANONICAL_CONTRACT_VERSION. The cross-language signed fixture vector
+	 * asserts equality so a silent drift fails tests on both sides.
+	 */
+	const CANONICAL_CONTRACT_VERSION = 2;
+
+	/**
 	 * Verify a command envelope's signature.
 	 *
 	 * The signature is computed over the EXPLICIT recursive canonical JSON form
-	 * (object keys sorted ascending, production wp_json_encode escaping: slashes
-	 * escaped as \/, non-ASCII as \uXXXX) with the "signature" field REMOVED.
+	 * (contract v2) with the "signature" field REMOVED.
 	 *
-	 * This is the cross-language byte contract: the backend signs
-	 * canonicalCommandJson() (Node) which sorts keys + escapes slashes/unicode
-	 * to match wp_json_encode; the plugin reproduces the IDENTICAL bytes here by
-	 * recursively ksort-ing the decoded structure then wp_json_encode-ing it.
-	 * Signing raw JSON.stringify / wp_json_encode output (unsorted, or with
-	 * differing slash/unicode escaping) would break verification whenever args
-	 * contain a URL (slash) or non-ASCII text.
+	 * The raw body is decoded with `json_decode( $raw, false )` so JSON objects
+	 * arrive as stdClass and JSON arrays as PHP arrays — this PRESERVES
+	 * object-vs-array identity. Decoding associatively (true) collapses both
+	 * `{}` and `[]` to an empty PHP array, so an empty object the backend
+	 * signed as `{}` would be re-canonicalized as `[]` and Ed25519
+	 * verification would fail for every command whose args carry an empty
+	 * object.
 	 *
 	 * @param string $raw_body      The raw HTTP response body.
 	 * @param string $signature_b64  The signature value from the JSON.
@@ -133,16 +140,17 @@ class Felix_Crypto {
 	 * @return bool
 	 */
 	public static function verify_command_signature( $raw_body, $signature_b64, $public_key_b64 ) {
-		$parsed = json_decode( $raw_body, true );
-		if ( ! is_array( $parsed ) ) {
+		$parsed = json_decode( $raw_body, false );
+		if ( ! is_object( $parsed ) ) {
 			return false;
 		}
 
-		// Remove the signature field.
-		unset( $parsed['signature'] );
+		// Remove the signature field (top-level property on the envelope object).
+		unset( $parsed->signature );
 
-		// Canonical: recursively sorted object keys + wp_json_encode escaping
-		// (slashes + unicode). MUST match the backend's canonicalCommandJson().
+		// Canonical: recursive object/array identity + sorted keys + slash/unicode
+		// escaping + ECMAScript number formatting. MUST match the backend's
+		// canonicalCommandJson() byte-for-byte.
 		$canonical = self::canonical_json( $parsed );
 		if ( false === $canonical ) {
 			return false;
@@ -152,51 +160,240 @@ class Felix_Crypto {
 	}
 
 	/**
-	 * Produce the recursive canonical JSON string for a value: object keys
-	 * sorted ascending (SORT_STRING), arrays preserved in order, using
-	 * wp_json_encode escaping (slashes → \/, non-ASCII → \uXXXX). This is the
-	 * exact byte contract the backend's canonicalCommandJson() reproduces.
+	 * Produce the recursive canonical JSON string (contract v2) for a value.
+	 *
+	 * The string is BUILT BYTE-BY-BYTE (not via wp_json_encode of the whole
+	 * structure) so that:
+	 *  - Object-vs-array identity is preserved: stdClass / associative array →
+	 *    object (empty → `{}`); sequential array → array (empty → `[]`).
+	 *  - Finite numbers use the ECMAScript Number::toString form (matching the
+	 *    backend's String(n)): `1e-7`, `1e+21`, `0.000001`, `42`, `-3.14`.
+	 *    PHP's `1.0e-7` dtoa output is normalized to this exact form.
+	 *  - Object keys are sorted ascending (SORT_STRING); arrays keep order.
+	 *  - Strings are escaped via wp_json_encode (slashes → `\/`, non-ASCII →
+	 *    `\uXXXX`), byte-identical to the backend encoder.
+	 *  - Non-finite numbers (NaN / ±Infinity) cause a `false` return
+	 *    (fail-closed: verification rejects, never verifies).
+	 *
+	 * @param mixed $data Decoded JSON value (stdClass/array/scalar).
+	 * @return string|false false on a non-finite number (fail-closed).
+	 */
+	public static function canonical_json( $data ) {
+		return self::encode_value( $data );
+	}
+
+	/**
+	 * Recursively encode a decoded JSON value to canonical bytes.
 	 *
 	 * @param mixed $data
 	 * @return string|false
 	 */
-	public static function canonical_json( $data ) {
-		return wp_json_encode( self::canonicalize( $data ) );
+	private static function encode_value( $data ) {
+		if ( null === $data ) {
+			return 'null';
+		}
+		if ( is_bool( $data ) ) {
+			return $data ? 'true' : 'false';
+		}
+		if ( is_int( $data ) ) {
+			return (string) $data;
+		}
+		if ( is_float( $data ) ) {
+			return self::encode_float( $data );
+		}
+		if ( is_string( $data ) ) {
+			return self::encode_string( $data );
+		}
+		if ( $data instanceof stdClass ) {
+			return self::encode_object( (array) $data );
+		}
+		if ( is_array( $data ) ) {
+			if ( self::is_sequential_list( $data ) ) {
+				return self::encode_array( $data );
+			}
+			// Associative PHP array (e.g. a test-built envelope) → object.
+			return self::encode_object( $data );
+		}
+		return 'null';
 	}
 
 	/**
-	 * Recursively sort object keys of a decoded JSON structure. A JSON object
-	 * (associative array) is ksort-ed; a JSON array (0-indexed) preserves order.
-	 * Empty arrays are left as-is (wp_json_encode renders them as []).
+	 * Encode a JSON object (stdClass or associative array): keys sorted
+	 * ascending (SORT_STRING). Empty → `{}`.
 	 *
-	 * @param mixed $data
-	 * @return mixed
+	 * @param array $props
+	 * @return string|false
 	 */
-	private static function canonicalize( $data ) {
-		if ( ! is_array( $data ) ) {
-			return $data;
+	private static function encode_object( $props ) {
+		ksort( $props, SORT_STRING );
+		$parts = array();
+		foreach ( $props as $k => $v ) {
+			$encoded = self::encode_value( $v );
+			if ( false === $encoded ) {
+				return false;
+			}
+			$parts[] = self::encode_string( (string) $k ) . ':' . $encoded;
 		}
-		if ( self::is_assoc_array( $data ) ) {
-			ksort( $data, SORT_STRING );
-		}
-		foreach ( $data as $k => $v ) {
-			$data[ $k ] = self::canonicalize( $v );
-		}
-		return $data;
+		return '{' . implode( ',', $parts ) . '}';
 	}
 
 	/**
-	 * True when $arr is an associative array (at least one non-sequential
-	 * string key), i.e. a decoded JSON OBJECT (vs a JSON array).
+	 * Encode a JSON array (sequential list): order preserved. Empty → `[]`.
+	 *
+	 * @param array $items
+	 * @return string|false
+	 */
+	private static function encode_array( $items ) {
+		$parts = array();
+		foreach ( $items as $item ) {
+			$encoded = self::encode_value( $item );
+			if ( false === $encoded ) {
+				return false;
+			}
+			$parts[] = $encoded;
+		}
+		return '[' . implode( ',', $parts ) . ']';
+	}
+
+	/**
+	 * Encode a JSON string with the byte-identical escaping the backend
+	 * produces: `/` → `\/`, non-ASCII → `\uXXXX` (UTF-8 decoded to code
+	 * points, supplementary as surrogate pairs), plus `"`, `\`, control chars.
+	 * Delegated to wp_json_encode so multi-byte UTF-8 is handled correctly.
+	 *
+	 * @param string $s
+	 * @return string
+	 */
+	private static function encode_string( $s ) {
+		$encoded = wp_json_encode( (string) $s );
+		if ( false === $encoded ) {
+			return '""';
+		}
+		return $encoded;
+	}
+
+	/**
+	 * Encode a finite float in the ECMAScript Number::toString byte form — the
+	 * single cross-language numeric contract (matches the backend's String(n)).
+	 * PHP's json_encode dtoa (serialize_precision = -1) gives the shortest
+	 * round-tripping digits but a different FORMAT (e.g. `1.0e-7`, `1.0e+20`);
+	 * this parses those digits into (sign, coefficient, decimal-exponent) and
+	 * re-formats them through the ECMAScript algorithm so both languages emit
+	 * identical bytes (e.g. `1e-7`, `100000000000000000000`).
+	 *
+	 * Non-finite (NaN / ±Infinity) → false (fail-closed).
+	 *
+	 * @param float $n
+	 * @return string|false
+	 */
+	private static function encode_float( $n ) {
+		if ( is_nan( $n ) || is_infinite( $n ) ) {
+			return false;
+		}
+		if ( $n == 0.0 ) {
+			return '0'; // +0.0 and -0.0 both canonicalize to "0".
+		}
+		$raw = json_encode( $n ); // shortest round-trip (serialize_precision = -1).
+		if ( false === $raw ) {
+			return '0';
+		}
+		return self::format_ecmascript_number( $raw );
+	}
+
+	/**
+	 * Re-format a PHP decimal float string (`[-]d[.d][e[+-]d]`) into the
+	 * ECMAScript Number::toString form. See ECMA-262 §6.1.6.1.20 / §7.1.12.1:
+	 * given the shortest decimal digits `s` (length k) and decimal-point
+	 * position n, the value s × 10^(n−k) is rendered as plain decimal where
+	 * possible and exponential otherwise (lowercase `e` with explicit sign).
+	 *
+	 * @param string $raw e.g. "1.0e-7", "1.5e-7", "0.1", "-3.14", "100", "1.0e+20".
+	 * @return string
+	 */
+	private static function format_ecmascript_number( $raw ) {
+		$negative = ( '-' === $raw[0] );
+		if ( $negative ) {
+			$raw = substr( $raw, 1 );
+		}
+
+		// Split mantissa and exponent (case-insensitive 'e').
+		$e_pos = stripos( $raw, 'e' );
+		$exp   = 0;
+		if ( false !== $e_pos ) {
+			$mantissa = substr( $raw, 0, $e_pos );
+			$exp      = (int) substr( $raw, $e_pos + 1 );
+		} else {
+			$mantissa = $raw;
+		}
+
+		// Split mantissa into integer/fractional digit strings.
+		$dot_pos  = strpos( $mantissa, '.' );
+		if ( false !== $dot_pos ) {
+			$int_part  = substr( $mantissa, 0, $dot_pos );
+			$frac_part = substr( $mantissa, $dot_pos + 1 );
+		} else {
+			$int_part  = $mantissa;
+			$frac_part = '';
+		}
+
+		// Coefficient = all mantissa digits; decimal exponent compensates for
+		// the fractional digits and the explicit exponent.
+		$digits = $int_part . $frac_part;
+		$decexp = $exp - strlen( $frac_part );
+
+		// Strip insignificant leading zeros.
+		$digits = ltrim( $digits, '0' );
+		if ( '' === $digits ) {
+			return '0';
+		}
+		// Strip trailing zeros (fold them into the decimal exponent).
+		$len = strlen( $digits );
+		while ( $len > 1 && '0' === $digits[ $len - 1 ] ) {
+			$digits = substr( $digits, 0, -1 );
+			++$decexp;
+			--$len;
+		}
+
+		$k = strlen( $digits );
+		$n = $decexp + $k; // decimal-point position (ECMAScript n).
+		$sign = $negative ? '-' : '';
+
+		if ( $k <= $n && $n <= 21 ) {
+			// Integer with at most 21 digits: digits + trailing zeros.
+			return $sign . $digits . str_repeat( '0', $n - $k );
+		}
+		if ( 0 < $n && $n <= 21 ) {
+			// Fractional: digits[0..n-1] . digits[n..k-1].
+			return $sign . substr( $digits, 0, $n ) . '.' . substr( $digits, $n );
+		}
+		if ( -6 < $n && $n <= 0 ) {
+			// Small fraction: 0. + (-n zeros) + digits.
+			return $sign . '0.' . str_repeat( '0', -$n ) . $digits;
+		}
+
+		// Exponential: d[.ddd]e[+-]ddd, exponent = n - 1.
+		$mantissa_out = $digits[0];
+		if ( $k > 1 ) {
+			$mantissa_out .= '.' . substr( $digits, 1 );
+		}
+		$p         = $n - 1;
+		$exp_sign = ( $p >= 0 ) ? '+' : '-';
+		return $sign . $mantissa_out . 'e' . $exp_sign . (string) abs( $p );
+	}
+
+	/**
+	 * True when $arr is a sequential (0-indexed) list, i.e. a decoded JSON
+	 * ARRAY (vs a decoded JSON object, which arrives as stdClass). An empty
+	 * array is a list → `[]`; an empty object arrives as stdClass → `{}`.
 	 *
 	 * @param array $arr
 	 * @return bool
 	 */
-	private static function is_assoc_array( $arr ) {
+	private static function is_sequential_list( $arr ) {
 		if ( empty( $arr ) ) {
-			return true; // empty → treated as object {} by canonical contract.
+			return true;
 		}
-		return array_keys( $arr ) !== range( 0, count( $arr ) - 1 );
+		return array_keys( $arr ) === range( 0, count( $arr ) - 1 );
 	}
 
 	/**
