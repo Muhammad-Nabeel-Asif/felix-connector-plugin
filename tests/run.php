@@ -1,6 +1,6 @@
 <?php
 /**
- * Behavioral tests for the Felix Connector command pipeline (v0.4.0).
+ * Behavioral tests for the Felix Connector command pipeline (v0.4.1).
  *
  * Covers: signature verification, envelope validation, write-authority
  * enforcement, deterministic atomic reservation, idempotent redelivery,
@@ -68,12 +68,25 @@ function reset_state() {
 	$wpdb->reset_all();
 	$GLOBALS['__felix_options']     = array();
 	$GLOBALS['__felix_handler_calls'] = 0;
+	if ( function_exists( 'felix_reset_wc' ) ) {
+		felix_reset_wc();
+	}
 
 	update_option( FELIX_OPT_STORE_ID, TEST_STORE_ID );
 	update_option( FELIX_OPT_GENERATION, TEST_GEN );
 	update_option( FELIX_OPT_PAIRED, true );
 	update_option( FELIX_OPT_KILL_SWITCHES, array() );
 	update_option( FELIX_OPT_SEEN_NONCES, array() );
+}
+
+/**
+ * Shared authorization bases for the handler tests.
+ */
+function read_basis() {
+	return array( 'kind' => 'graduated_rule', 'ruleId' => 'connector-read' );
+}
+function write_basis() {
+	return array( 'kind' => 'approval', 'approvalId' => 'ap-test' );
 }
 
 function make_backend_key() {
@@ -817,6 +830,566 @@ function test_authorization_basis_object_form() {
 	expect( 'string authorization_basis rejected (proves #1 contract)', ! $r2['ok'] );
 }
 
+// =============================================================================
+// V0.4.1 COMMAND-SURFACE PARITY TESTS
+// =============================================================================
+//
+// The new handler surface (refund.create, get_coupon, list_coupons, get_product,
+// sync_coupons, register_webhooks, verify_webhooks, remove_webhooks, create_order,
+// delete_customer) is exercised here end-to-end against the in-memory WC/WP
+// shims in bootstrap.php. Each group covers a happy path AND a validation
+// failure; additionally: over-refund rejection, admin-refusal on delete_customer,
+// and idempotent webhook re-registration.
+
+/**
+ * Seed an order into the in-memory store. Returns the order id.
+ */
+function seed_order( $overrides = array() ) {
+	$id = ++$GLOBALS['__felix_next_id']['order'];
+	$GLOBALS['__felix_orders_meta'][ $id ] = array_merge(
+		array(
+			'status'         => 'processing',
+			'total'          => 100.0,
+			'total_refunded' => 0.0,
+			'currency'       => 'USD',
+			'number'         => (string) $id,
+			'customer_id'    => 0,
+			'created'        => time(),
+			'items'          => array(),
+			'billing'        => array(),
+			'shipping'       => array(),
+			'payment_method' => 'stripe',
+		),
+		$overrides
+	);
+	return $id;
+}
+
+/**
+ * Seed a product. Returns the product id.
+ */
+function seed_product( $overrides = array() ) {
+	$id = ++$GLOBALS['__felix_next_id']['product'];
+	$GLOBALS['__felix_products_meta'][ $id ] = array_merge(
+		array(
+			'name'            => 'Widget ' . $id,
+			'slug'            => 'widget-' . $id,
+			'status'          => 'publish',
+			'type'            => 'simple',
+			'price'           => '10.00',
+			'regularPrice'    => '10.00',
+			'salePrice'       => '',
+			'sku'             => 'SKU-' . $id,
+			'manageStock'     => true,
+			'stockStatus'     => 'instock',
+			'stockQuantity'   => 50,
+			'description'     => 'A widget.',
+			'shortDescription'=> 'Widget.',
+		),
+		$overrides
+	);
+	return $id;
+}
+
+/**
+ * Seed a coupon AND its shop_coupon CPT post (the CPT powers list/sync via
+ * WP_Query). Returns the coupon id.
+ */
+function seed_coupon( $code, $overrides = array(), $post_overrides = array() ) {
+	$id     = ++$GLOBALS['__felix_next_id']['coupon'];
+	$modified_ts = $post_overrides['modified'] ?? time();
+	$date_ts     = $post_overrides['date'] ?? $modified_ts;
+	$GLOBALS['__felix_coupons'][ $id ] = array_merge(
+		array(
+			'code'         => wc_sanitize_coupon_code( $code ),
+			'discountType' => 'percent',
+			'amount'       => 10,
+			'status'       => 'publish',
+			'dateExpires'  => null,
+			'usageCount'   => 0,
+			'usageLimit'   => 0,
+			'freeShipping' => false,
+			'productIds'   => array(),
+		),
+		$overrides
+	);
+	$GLOBALS['__felix_coupon_code_index'][ wc_sanitize_coupon_code( $code ) ] = $id;
+
+	$post                 = new stdClass();
+	$post->ID             = $id;
+	$post->post_title     = $code;
+	$post->post_modified  = gmdate( 'Y-m-d H:i:s', $modified_ts );
+	$post->post_date      = gmdate( 'Y-m-d H:i:s', $date_ts );
+	$GLOBALS['__felix_coupon_posts'][ $id ] = $post;
+	return $id;
+}
+
+/**
+ * Seed a webhook. Returns the webhook id.
+ */
+function seed_webhook( $topic, $delivery_url, $overrides = array() ) {
+	$id = ++$GLOBALS['__felix_next_id']['webhook'];
+	$GLOBALS['__felix_webhooks'][ $id ] = array_merge(
+		array(
+			'name'         => 'Felix',
+			'status'       => 'active',
+			'topic'        => $topic,
+			'delivery_url' => $delivery_url,
+			'secret'       => 's',
+			'api_version'  => 3,
+		),
+		$overrides
+	);
+	return $id;
+}
+
+/**
+ * Seed a WP user. Returns the user id.
+ */
+function seed_user( $overrides = array() ) {
+	$id = ++$GLOBALS['__felix_next_id']['user'];
+	$data = array_merge(
+		array(
+			'ID'           => $id,
+			'user_email'   => 'user' . $id . '@example.com',
+			'roles'        => array( 'customer' ),
+			'display_name' => 'Customer ' . $id,
+		),
+		$overrides
+	);
+	$GLOBALS['__felix_users'][ $id ] = new WP_User( $data );
+	return $id;
+}
+
+/**
+ * Execute a handler directly (bypassing the processor) with a write basis.
+ */
+function exec_write( $type, $args ) {
+	$h = new Felix_Command_Handlers();
+	return $h->execute( 'cmd-' . $type, $type, $args, write_basis() );
+}
+function exec_read( $type, $args ) {
+	$h = new Felix_Command_Handlers();
+	return $h->execute( 'cmd-' . $type, $type, $args, read_basis() );
+}
+
+/**
+ * Every connector-produced command type has BOTH a family AND a handler, and
+ * the new write families are classified as writes (read basis denies them).
+ */
+function test_command_surface_parity() {
+	echo "\n[command-surface parity — family + handler for every type]\n";
+
+	$types = array(
+		'ping', 'get_order', 'search_orders', 'sync_orders', 'sync_products', 'sync_coupons',
+		'get_product', 'list_products', 'list_customers',
+		'get_subscription', 'list_subscriptions', 'list_subscriptions_for_customer',
+		'get_coupon', 'list_coupons',
+		'register_webhooks', 'verify_webhooks', 'remove_webhooks',
+		'update_order_status', 'update_order_shipping_address', 'create_order',
+		'create_coupon', 'update_coupon', 'deactivate_coupon',
+		'update_subscription_status', 'renew_subscription',
+		'refund.create', 'delete_customer',
+	);
+
+	$no_family = array();
+	foreach ( $types as $type ) {
+		if ( null === Felix_Command_Handlers::family_for( $type ) ) {
+			$no_family[] = $type;
+		}
+	}
+	expect( 'every parity type has a family', empty( $no_family ) );
+
+	// Every parity type has a handler registered (introspect the registry so
+	// we don't depend on execution-time WC stubs for handlers not under test).
+	$no_handler = array();
+	$h          = new Felix_Command_Handlers();
+	$prop       = new ReflectionProperty( 'Felix_Command_Handlers', 'handlers' );
+	$prop->setAccessible( true );
+	$registered = $prop->getValue( $h );
+	foreach ( $types as $type ) {
+		if ( ! isset( $registered[ $type ] ) ) {
+			$no_handler[] = $type;
+		}
+	}
+	expect( 'every parity type has a handler (none unknown_type)', empty( $no_handler ) );
+
+	// New write families must be classified as WRITE (read basis insufficient).
+	expect( 'order_create is a write family', ! Felix_Command_Handlers::is_read_family( 'order_create' ) );
+	expect( 'customer_write is a write family', ! Felix_Command_Handlers::is_read_family( 'customer_write' ) );
+	expect( 'refund is a write family', ! Felix_Command_Handlers::is_read_family( 'refund' ) );
+	expect( 'webhook_management is a write family', ! Felix_Command_Handlers::is_read_family( 'webhook_management' ) );
+
+	// Read families for the new read handlers.
+	expect( 'coupon_read is a read family', Felix_Command_Handlers::is_read_family( 'coupon_read' ) );
+	expect( 'product_read is a read family', Felix_Command_Handlers::is_read_family( 'product_read' ) );
+}
+
+/**
+ * refund.create — happy path + over-refund rejection + missing-args failure +
+ * a WP_Error from wc_create_refund surfaces the store's message (never reports
+ * success without a refund id).
+ */
+function test_refund_create() {
+	echo "\n[refund.create — happy, over-refund reject, validation]\n";
+	reset_state();
+
+	// Happy path: full refund on a $100 order.
+	$oid = seed_order( array( 'total' => 100.0 ) );
+	$r   = exec_write( 'refund.create', array( 'orderId' => $oid, 'amount' => 25, 'reason' => 'customer request' ) );
+	expect_eq( 'refund.create happy => done', $r['status'], 'done' );
+	expect_eq( 'refund has an id', $r['result']['refund']['id'] > 0, true );
+	expect_eq( 'refund amount echoed', $r['result']['refund']['amount'], 25 );
+	expect_eq( 'order totalRefunded reflects refund', $r['result']['order']['totalRefunded'], 25 );
+	expect( 'refund dateCreated present', ! empty( $r['result']['refund']['dateCreated'] ) );
+
+	// Over-refund: $200 on a $75 remaining ($100 total − $25 already refunded).
+	$r2 = exec_write( 'refund.create', array( 'orderId' => $oid, 'amount' => 200, 'reason' => 'too much' ) );
+	expect_eq( 'over-refund => failed', $r2['status'], 'failed' );
+	expect( 'over-refund message mentions exceeds', false !== strpos( $r2['error']['message'], 'exceeds' ) );
+
+	// Exactly-remaining refund succeeds (boundary).
+	$r3 = exec_write( 'refund.create', array( 'orderId' => $oid, 'amount' => 75, 'reason' => 'remainder' ) );
+	expect_eq( 'remaining-total refund succeeds', $r3['status'], 'done' );
+
+	// Missing args.
+	$r4 = exec_write( 'refund.create', array( 'orderId' => $oid ) );
+	expect_eq( 'missing amount => failed', $r4['status'], 'failed' );
+
+	// Unknown order.
+	$r5 = exec_write( 'refund.create', array( 'orderId' => 999999, 'amount' => 5 ) );
+	expect_eq( 'unknown order => failed', $r5['status'], 'failed' );
+}
+
+/**
+ * get_coupon — happy path (code + couponId) + not-found + missing-args.
+ */
+function test_get_coupon() {
+	echo "\n[get_coupon — happy, not-found, validation]\n";
+	reset_state();
+
+	$cid = seed_coupon( 'SAVE10', array( 'discountType' => 'percent', 'amount' => 10, 'freeShipping' => true, 'productIds' => array( 7, 8 ) ) );
+
+	$r = exec_read( 'get_coupon', array( 'code' => 'SAVE10' ) );
+	expect_eq( 'get_coupon by code => done', $r['status'], 'done' );
+	expect_eq( 'coupon id matches', $r['result']['coupon']['id'], $cid );
+	expect_eq( 'coupon code uppercased on store', $r['result']['coupon']['code'], 'save10' );
+	expect_eq( 'discountType projected', $r['result']['coupon']['discountType'], 'percent' );
+	expect_eq( 'amount projected', $r['result']['coupon']['amount'], 10 );
+	expect_eq( 'freeShipping projected', $r['result']['coupon']['freeShipping'], true );
+	expect_eq( 'productIds projected', $r['result']['coupon']['productIds'], array( 7, 8 ) );
+
+	$r2 = exec_read( 'get_coupon', array( 'couponId' => $cid ) );
+	expect_eq( 'get_coupon by id => done', $r2['status'], 'done' );
+
+	$r3 = exec_read( 'get_coupon', array( 'code' => 'NOPE' ) );
+	expect_eq( 'unknown coupon => failed', $r3['status'], 'failed' );
+
+	$r4 = exec_read( 'get_coupon', array() );
+	expect_eq( 'missing code+id => failed', $r4['status'], 'failed' );
+}
+
+/**
+ * list_coupons — paged list + hasMore pagination + search + perPage cap.
+ */
+function test_list_coupons() {
+	echo "\n[list_coupons — paged, hasMore, search]\n";
+	reset_state();
+
+	for ( $i = 0; $i < 5; $i++ ) {
+		seed_coupon( 'C' . $i );
+	}
+	seed_coupon( 'PROMO-X' );
+
+	// page 1 of perPage 2 → 2 items, hasMore true.
+	$r = exec_read( 'list_coupons', array( 'page' => 1, 'perPage' => 2 ) );
+	expect_eq( 'list_coupons => done', $r['status'], 'done' );
+	expect_eq( 'page size respected', count( $r['result']['coupons'] ), 2 );
+	expect_eq( 'hasMore true when more remain', $r['result']['hasMore'], true );
+
+	// page 3 of perPage 2 → 1 item (6 total), hasMore false.
+	$r2 = exec_read( 'list_coupons', array( 'page' => 3, 'perPage' => 2 ) );
+	expect_eq( 'last page hasMore false', $r2['result']['hasMore'], false );
+
+	// search narrows to the PROMO title.
+	$r3 = exec_read( 'list_coupons', array( 'search' => 'PROMO', 'perPage' => 50 ) );
+	expect_eq( 'search matches 1 coupon', count( $r3['result']['coupons'] ), 1 );
+	expect_eq( 'search matched PROMO-X', $r3['result']['coupons'][0]['code'], 'promo-x' );
+
+	// perPage cap at 50 even when over-requested.
+	$r4 = exec_read( 'list_coupons', array( 'perPage' => 9999 ) );
+	expect_eq( 'perPage capped (no failure)', $r4['status'], 'done' );
+}
+
+/**
+ * get_product — by id and by sku, categories appended, not-found, missing-args.
+ */
+function test_get_product() {
+	echo "\n[get_product — by id, by sku, categories]\n";
+	reset_state();
+
+	$pid = seed_product( array( 'sku' => 'WIDGET-42', 'description' => 'A fine widget.' ) );
+	// seed a product_cat term.
+	$term       = new stdClass();
+	$term->name = 'Gear';
+	$GLOBALS['__felix_terms'][ $pid ]['product_cat'] = array( $term );
+
+	$r = exec_read( 'get_product', array( 'productId' => $pid ) );
+	expect_eq( 'get_product by id => done', $r['status'], 'done' );
+	expect_eq( 'description projected', $r['result']['product']['description'], 'A fine widget.' );
+	expect( 'stockQuantity projected', null !== $r['result']['product']['stockQuantity'] );
+	expect_eq( 'categories appended', $r['result']['product']['categories'], array( 'Gear' ) );
+
+	$r2 = exec_read( 'get_product', array( 'sku' => 'WIDGET-42' ) );
+	expect_eq( 'get_product by sku => done', $r2['status'], 'done' );
+	expect_eq( 'sku lookup resolves id', $r2['result']['product']['id'], $pid );
+
+	$r3 = exec_read( 'get_product', array( 'sku' => 'MISSING' ) );
+	expect_eq( 'unknown sku => failed', $r3['status'], 'failed' );
+
+	$r4 = exec_read( 'get_product', array() );
+	expect_eq( 'missing productId+sku => failed', $r4['status'], 'failed' );
+}
+
+/**
+ * sync_coupons — mirrors sync_orders: paged, modified_after cursor, ASC.
+ */
+function test_sync_coupons() {
+	echo "\n[sync_coupons — paged, modified_after cursor, ASC]\n";
+	reset_state();
+
+	$old = seed_coupon( 'OLD', array(), array( 'modified' => time() - 3600 ) );
+	$new = seed_coupon( 'NEW', array(), array( 'modified' => time() - 60 ) );
+
+	// No cursor → both returned, ASC by modified (OLD before NEW).
+	$r = exec_read( 'sync_coupons', array() );
+	expect_eq( 'sync_coupons no cursor => done', $r['status'], 'done' );
+	expect_eq( 'returns all coupons', count( $r['result']['coupons'] ), 2 );
+	expect_eq( 'ASC order (OLD first)', $r['result']['coupons'][0]['code'], 'old' );
+
+	// modified_after cursor → only the recently-modified coupon.
+	$r2 = exec_read( 'sync_coupons', array( 'modifiedAfter' => gmdate( 'Y-m-d H:i:s', time() - 120 ) ) );
+	expect_eq( 'modified_after filters older coupon', count( $r2['result']['coupons'] ), 1 );
+	expect_eq( 'only NEW coupon after cursor', $r2['result']['coupons'][0]['code'], 'new' );
+
+	// paged: limit 1 page 1 → 1 item.
+	$r3 = exec_read( 'sync_coupons', array( 'limit' => 1, 'page' => 1 ) );
+	expect_eq( 'limit respected', count( $r3['result']['coupons'] ), 1 );
+}
+
+/**
+ * register_webhooks — happy path + IDEMPOTENT re-register (same deliveryUrl +
+ * topic skipped, not duplicated).
+ */
+function test_register_webhooks() {
+	echo "\n[register_webhooks — happy + idempotent re-register]\n";
+	reset_state();
+
+	$r = exec_write( 'register_webhooks', array(
+		'deliveryUrl' => 'https://felix.example.com/hook',
+		'secret'      => 'topsecret',
+		'topics'      => array( 'order.created', 'order.updated' ),
+	) );
+	expect_eq( 'register_webhooks => done', $r['status'], 'done' );
+	expect_eq( 'both topics registered', count( $r['result']['registered'] ), 2 );
+	expect_eq( 'none skipped first time', count( $r['result']['skipped'] ), 0 );
+	expect( 'registered entries carry ids', $r['result']['registered'][0]['id'] > 0 );
+
+	// Idempotent re-register: same deliveryUrl + topics → all skipped.
+	$r2 = exec_write( 'register_webhooks', array(
+		'deliveryUrl' => 'https://felix.example.com/hook',
+		'secret'      => 'topsecret',
+		'topics'      => array( 'order.created', 'order.updated' ),
+	) );
+	expect_eq( 're-register => done', $r2['status'], 'done' );
+	expect_eq( 're-register none newly registered', count( $r2['result']['registered'] ), 0 );
+	expect_eq( 're-register all skipped (idempotent)', count( $r2['result']['skipped'] ), 2 );
+
+	// A new topic alongside an existing one → 1 registered, 1 skipped.
+	$r3 = exec_write( 'register_webhooks', array(
+		'deliveryUrl' => 'https://felix.example.com/hook',
+		'secret'      => 'topsecret',
+		'topics'      => array( 'order.created', 'order.deleted' ),
+	) );
+	expect_eq( 'mixed: 1 newly registered', count( $r3['result']['registered'] ), 1 );
+	expect_eq( 'mixed: 1 skipped', count( $r3['result']['skipped'] ), 1 );
+	expect_eq( 'newly registered is order.deleted', $r3['result']['registered'][0]['topic'], 'order.deleted' );
+
+	// Validation: missing topics.
+	$r4 = exec_write( 'register_webhooks', array( 'deliveryUrl' => 'https://x.example.com/hook' ) );
+	expect_eq( 'missing topics => failed', $r4['status'], 'failed' );
+}
+
+/**
+ * verify_webhooks — active / missing / disabled classification for a deliveryUrl.
+ */
+function test_verify_webhooks() {
+	echo "\n[verify_webhooks — active, missing, disabled]\n";
+	reset_state();
+
+	seed_webhook( 'order.created', 'https://felix.example.com/hook', array( 'status' => 'active' ) );
+	seed_webhook( 'order.updated', 'https://felix.example.com/hook', array( 'status' => 'paused' ) );
+	// A webhook for a DIFFERENT delivery url must be ignored.
+	seed_webhook( 'order.created', 'https://other.example.com/hook', array( 'status' => 'active' ) );
+
+	$r = exec_write( 'verify_webhooks', array(
+		'deliveryUrl' => 'https://felix.example.com/hook',
+		'topics'      => array( 'order.created', 'order.updated', 'order.deleted' ),
+	) );
+	expect_eq( 'verify_webhooks => done', $r['status'], 'done' );
+	expect_eq( 'active topic listed', $r['result']['active'], array( 'order.created' ) );
+	expect_eq( 'missing topic listed', $r['result']['missing'], array( 'order.deleted' ) );
+	expect_eq( 'disabled topic carried with status', $r['result']['disabled'][0]['topic'], 'order.updated' );
+	expect_eq( 'disabled topic status paused', $r['result']['disabled'][0]['status'], 'paused' );
+
+	$r2 = exec_write( 'verify_webhooks', array( 'deliveryUrl' => 'https://felix.example.com/hook' ) );
+	expect_eq( 'missing topics => failed', $r2['status'], 'failed' );
+}
+
+/**
+ * remove_webhooks — deletes only matching delivery_url, counts removed.
+ */
+function test_remove_webhooks() {
+	echo "\n[remove_webhooks — delete matching deliveryUrl]\n";
+	reset_state();
+
+	seed_webhook( 'order.created', 'https://felix.example.com/hook' );
+	seed_webhook( 'order.updated', 'https://felix.example.com/hook' );
+	seed_webhook( 'order.created', 'https://other.example.com/hook' );
+
+	$r = exec_write( 'remove_webhooks', array( 'deliveryUrl' => 'https://felix.example.com/hook' ) );
+	expect_eq( 'remove_webhooks => done', $r['status'], 'done' );
+	expect_eq( 'removed both matching webhooks', $r['result']['removed'], 2 );
+
+	// Second removal on same url → 0 (already gone).
+	$r2 = exec_write( 'remove_webhooks', array( 'deliveryUrl' => 'https://felix.example.com/hook' ) );
+	expect_eq( 'idempotent remove returns 0', $r2['result']['removed'], 0 );
+
+	// The unrelated webhook survives.
+	$r3 = exec_write( 'verify_webhooks', array(
+		'deliveryUrl' => 'https://other.example.com/hook',
+		'topics'      => array( 'order.created' ),
+	) );
+	expect_eq( 'unrelated webhook survives', $r3['result']['active'], array( 'order.created' ) );
+
+	$r4 = exec_write( 'remove_webhooks', array() );
+	expect_eq( 'missing deliveryUrl => failed', $r4['status'], 'failed' );
+}
+
+/**
+ * create_order — happy path + zero-price (comp-order) override semantics +
+ * missing lineItems + unknown product.
+ */
+function test_create_order() {
+	echo "\n[create_order — happy, zero-price override, validation]\n";
+	reset_state();
+
+	$p1 = seed_product( array( 'price' => '10.00', 'name' => 'Hat' ) );
+	$p2 = seed_product( array( 'price' => '25.00', 'name' => 'Bag' ) );
+
+	$r = exec_write( 'create_order', array(
+		'lineItems' => array(
+			array( 'productId' => $p1, 'quantity' => 2 ),
+			array( 'productId' => $p2, 'quantity' => 1 ),
+		),
+		'shippingAddress' => array( 'firstName' => 'Ada', 'lastName' => 'Lovelace', 'address1' => '1 Main', 'city' => 'London', 'postcode' => 'W1', 'country' => 'GB' ),
+		'status'          => 'processing',
+		'note'            => 'comp order',
+	) );
+	expect_eq( 'create_order => done', $r['status'], 'done' );
+	expect( 'order id assigned', $r['result']['order']['id'] > 0 );
+	expect_eq( 'total = 2*10 + 1*25', $r['result']['order']['total'], 45.0 );
+	expect_eq( 'default status processing', $r['result']['order']['status'], 'processing' );
+	expect_eq( 'lineItems projected', count( $r['result']['order']['lineItems'] ), 2 );
+
+	// Zero-price override AFTER calculate_totals → total reflects overrides.
+	$r2 = exec_write( 'create_order', array(
+		'lineItems' => array(
+			array( 'productId' => $p1, 'quantity' => 2, 'priceOverride' => 0 ),
+			array( 'productId' => $p2, 'quantity' => 1 ),
+		),
+	) );
+	expect_eq( 'override total = 2*0 + 1*25', $r2['result']['order']['total'], 25.0 );
+	expect_eq( 'overridden line total zero', $r2['result']['order']['lineItems'][0]['total'], 0.0 );
+
+	// Missing lineItems.
+	$r3 = exec_write( 'create_order', array( 'status' => 'completed' ) );
+	expect_eq( 'missing lineItems => failed', $r3['status'], 'failed' );
+
+	// Unknown product id.
+	$r4 = exec_write( 'create_order', array( 'lineItems' => array( array( 'productId' => 999999, 'quantity' => 1 ) ) ) );
+	expect_eq( 'unknown product => failed', $r4['status'], 'failed' );
+}
+
+/**
+ * delete_customer — happy path + ADMIN-REFUSAL + shop-manager refusal +
+ * not-found. Customer orders are retained.
+ */
+function test_delete_customer() {
+	echo "\n[delete_customer — happy, admin-refusal, not-found]\n";
+	reset_state();
+
+	$cust = seed_user( array( 'user_email' => 'cust@example.com', 'roles' => array( 'customer' ) ) );
+	$admin = seed_user( array( 'user_email' => 'admin@example.com', 'roles' => array( 'administrator' ) ) );
+	$mgr   = seed_user( array( 'user_email' => 'mgr@example.com', 'roles' => array( 'shop_manager' ) ) );
+
+	// Happy path by id.
+	$r = exec_write( 'delete_customer', array( 'customerId' => $cust ) );
+	expect_eq( 'delete customer => done', $r['status'], 'done' );
+	expect_eq( 'deleted true', $r['result']['deleted'], true );
+	expect_eq( 'customerId echoed', $r['result']['customerId'], $cust );
+	expect_eq( 'ordersRetained true', $r['result']['ordersRetained'], true );
+	expect( 'user removed from store', ! isset( $GLOBALS['__felix_users'][ $cust ] ) );
+
+	// Refuse admin (explicit error).
+	$r2 = exec_write( 'delete_customer', array( 'customerId' => $admin ) );
+	expect_eq( 'admin deletion refused => failed', $r2['status'], 'failed' );
+	expect( 'refusal message mentions non-customer', false !== strpos( $r2['error']['message'], 'non-customer' ) );
+	expect( 'admin still present (not deleted)', isset( $GLOBALS['__felix_users'][ $admin ] ) );
+
+	// Refuse shop-manager by email lookup.
+	$r3 = exec_write( 'delete_customer', array( 'email' => 'mgr@example.com' ) );
+	expect_eq( 'shop_manager deletion refused => failed', $r3['status'], 'failed' );
+	expect( 'shop_manager still present', isset( $GLOBALS['__felix_users'][ $mgr ] ) );
+
+	// Resolve-by-email happy path.
+	$cust2 = seed_user( array( 'user_email' => 'cust2@example.com', 'roles' => array( 'customer' ) ) );
+	$r4 = exec_write( 'delete_customer', array( 'email' => 'cust2@example.com' ) );
+	expect_eq( 'delete customer by email => done', $r4['status'], 'done' );
+
+	// Not found.
+	$r5 = exec_write( 'delete_customer', array( 'customerId' => 999999 ) );
+	expect_eq( 'unknown customer => failed', $r5['status'], 'failed' );
+
+	// Missing args.
+	$r6 = exec_write( 'delete_customer', array() );
+	expect_eq( 'missing customerId+email => failed', $r6['status'], 'failed' );
+}
+
+/**
+ * A read basis (connector-read) is DENIED for the new write families but
+ * allowed for the new read families — proven through the shared processor.
+ */
+function test_new_family_authorization_classification() {
+	echo "\n[new family read/write authorization classification]\n";
+
+	// refund.create (refund) — write family: connector-read denied.
+	expect( 'refund denied for connector-read', ! Felix_Command_Handlers::authorize( 'refund', read_basis() )['ok'] );
+	// create_order (order_create) — write family.
+	expect( 'order_create denied for connector-read', ! Felix_Command_Handlers::authorize( 'order_create', read_basis() )['ok'] );
+	// delete_customer (customer_write) — write family.
+	expect( 'customer_write denied for connector-read', ! Felix_Command_Handlers::authorize( 'customer_write', read_basis() )['ok'] );
+	// register_webhooks (webhook_management) — write family.
+	expect( 'webhook_management denied for connector-read', ! Felix_Command_Handlers::authorize( 'webhook_management', read_basis() )['ok'] );
+
+	// get_coupon / list_coupons (coupon_read) — read family: connector-read allowed.
+	expect( 'coupon_read allowed for connector-read', Felix_Command_Handlers::authorize( 'coupon_read', read_basis() )['ok'] );
+	// get_product (product_read) — read family.
+	expect( 'product_read allowed for connector-read', Felix_Command_Handlers::authorize( 'product_read', read_basis() )['ok'] );
+	// sync_coupons (sync) — read family.
+	expect( 'sync allowed for connector-read', Felix_Command_Handlers::authorize( 'sync', read_basis() )['ok'] );
+}
+
 // The runner class is only loaded via felix-connector.php (not in the test
 // bootstrap), but capability_list is referenced statically. Load it safely.
 if ( ! class_exists( 'Felix_Runner' ) ) {
@@ -886,6 +1459,20 @@ test_fresh_conflict_then_later_terminal_retrieval();
 test_renew_handler_registered();
 test_authorization_basis_object_form();
 test_pairing_code_normalization();
+
+// v0.4.1 command-surface parity.
+test_command_surface_parity();
+test_refund_create();
+test_get_coupon();
+test_list_coupons();
+test_get_product();
+test_sync_coupons();
+test_register_webhooks();
+test_verify_webhooks();
+test_remove_webhooks();
+test_create_order();
+test_delete_customer();
+test_new_family_authorization_classification();
 
 echo str_repeat( '=', 60 ) . "\n";
 $total = $GLOBALS['__pass'] + $GLOBALS['__fail'];
