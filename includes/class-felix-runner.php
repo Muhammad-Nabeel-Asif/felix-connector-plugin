@@ -188,48 +188,76 @@ class Felix_Runner {
 	 * WP-Cron entry point — short bounded cycle.
 	 *
 	 * Does a best-effort acquisition of flock + DB lease, then runs
-	 * a small number of poll cycles within a time budget (~60s).
+	 * a small number of poll cycles within a time budget (~50s).
 	 * If locks cannot be acquired, exits silently (external cron has it).
+	 *
+	 * @return string success|error|skipped
 	 */
 	public function run_wp_cron() {
+		return $this->run_bounded( 50, 3, null, 'WP-Cron' );
+	}
+
+	/**
+	 * Admin / post-pair check-in — one short poll so the settings page
+	 * does not hang for a full WP-Cron cycle.
+	 *
+	 * @return string success|error|skipped
+	 */
+	public function run_checkin() {
+		return $this->run_bounded( 20, 1, 8, 'check-in' );
+	}
+
+	/**
+	 * Bounded poll cycle shared by WP-Cron and admin check-in.
+	 *
+	 * @param int         $budget_seconds     Wall-clock budget.
+	 * @param int         $max_polls          Cap on poll_once() calls.
+	 * @param int|null    $poll_hold_override Temporary long-poll hold (seconds), or null to keep the host-profile value.
+	 * @param string      $label              Log label.
+	 * @return string success|error|skipped
+	 */
+	private function run_bounded( $budget_seconds, $max_polls, $poll_hold_override, $label ) {
 		if ( ! Felix_Pairing::is_paired() ) {
 			$this->record_run( 'skipped' );
-			return;
+			return 'skipped';
 		}
 
-		// Time budget for WP-Cron — keep it short to avoid PHP timeouts.
-		$budget_seconds = 50;
-		$max_polls      = 3;
-		$start_time     = time();
-		$deadline       = $start_time + $budget_seconds;
+		$saved_hold = $this->poll_hold_seconds;
+		if ( null !== $poll_hold_override ) {
+			$this->poll_hold_seconds = max( 1, (int) $poll_hold_override );
+		}
 
-		// Attempt flock acquisition (non-blocking — don't wait).
+		$start_time = time();
+		$deadline   = $start_time + (int) $budget_seconds;
+
 		$this->lock_handle = @fopen( $this->lock_file, 'c' );
 		if ( ! $this->lock_handle ) {
+			$this->poll_hold_seconds = $saved_hold;
 			$this->record_run( 'error' );
-			return;
+			$this->record_poll_error( 'Could not open runner lock file.' );
+			return 'error';
 		}
 
 		if ( ! flock( $this->lock_handle, LOCK_EX | LOCK_NB ) ) {
-			// External cron (or another WP-Cron process) has the lock.
+			$this->poll_hold_seconds = $saved_hold;
 			$this->record_run( 'skipped' );
 			fclose( $this->lock_handle );
 			$this->lock_handle = null;
-			return;
+			return 'skipped';
 		}
 
-		// Attempt DB lease.
 		if ( ! $this->acquire_lease() ) {
+			$this->poll_hold_seconds = $saved_hold;
 			$this->record_run( 'skipped' );
 			flock( $this->lock_handle, LOCK_UN );
 			fclose( $this->lock_handle );
 			$this->lock_handle = null;
-			return;
+			return 'skipped';
 		}
 
-		$this->log( sprintf( 'WP-Cron cycle started (holder=%s, budget=%ds)', $this->holder_id, $budget_seconds ) );
+		$this->log( sprintf( '%s cycle started (holder=%s, budget=%ds, polls=%d)', $label, $this->holder_id, $budget_seconds, $max_polls ) );
 
-		$polls = 0;
+		$polls     = 0;
 		$had_error = false;
 
 		while ( time() < $deadline && $polls < $max_polls ) {
@@ -238,12 +266,10 @@ class Felix_Runner {
 
 			$result = $this->poll_once();
 
-			if ( $result === false ) {
+			if ( false === $result ) {
 				$this->error_count++;
 				$had_error = true;
-
-				// In WP-Cron, don't do long backoffs — just break after one error.
-				$this->log( sprintf( 'WP-Cron poll error #%d, ending cycle', $this->error_count ) );
+				$this->log( sprintf( '%s poll error #%d, ending cycle', $label, $this->error_count ) );
 				break;
 			}
 
@@ -259,13 +285,16 @@ class Felix_Runner {
 		}
 
 		$this->release_lease();
-		$this->log( sprintf( 'WP-Cron cycle complete (%d polls, %ds)', $polls, time() - $start_time ) );
+		$this->log( sprintf( '%s cycle complete (%d polls, %ds)', $label, $polls, time() - $start_time ) );
 
 		flock( $this->lock_handle, LOCK_UN );
 		fclose( $this->lock_handle );
 		$this->lock_handle = null;
+		$this->poll_hold_seconds = $saved_hold;
 
-		$this->record_run( $had_error ? 'error' : 'success' );
+		$status = $had_error ? 'error' : 'success';
+		$this->record_run( $status );
+		return $status;
 	}
 
 	/**
@@ -286,6 +315,29 @@ class Felix_Runner {
 	}
 
 	/**
+	 * Persist the last poll failure for the diagnostics panel.
+	 *
+	 * @param string $message
+	 */
+	private function record_poll_error( $message ) {
+		update_option(
+			FELIX_OPT_LAST_POLL_ERROR,
+			array(
+				'message' => (string) $message,
+				'at'      => time(),
+			),
+			false
+		);
+	}
+
+	/**
+	 * Clear a prior poll error after a successful poll.
+	 */
+	private function clear_poll_error() {
+		delete_option( FELIX_OPT_LAST_POLL_ERROR );
+	}
+
+	/**
 	 * Perform one long-poll cycle.
 	 *
 	 * @return bool True on success, false on error.
@@ -299,6 +351,7 @@ class Felix_Runner {
 		$secret  = Felix_Crypto::get_secret_key( $keypair['encryptedSecret'] );
 		if ( ! $secret ) {
 			$this->log( 'Could not decrypt secret key.' );
+			$this->record_poll_error( 'Could not decrypt plugin secret key.' );
 			return false;
 		}
 
@@ -348,7 +401,9 @@ class Felix_Runner {
 		);
 
 		if ( is_wp_error( $response ) ) {
-			$this->log( 'WP Error: ' . $response->get_error_message() );
+			$err = $response->get_error_message();
+			$this->log( 'WP Error: ' . $err );
+			$this->record_poll_error( $err );
 			$this->degraded = true;
 			return false;
 		}
@@ -357,14 +412,17 @@ class Felix_Runner {
 		$raw_body    = wp_remote_retrieve_body( $response );
 
 		if ( 204 === $status_code ) {
+			$this->clear_poll_error();
 			return true; // No command.
 		}
 
 		if ( 200 !== $status_code ) {
 			if ( 401 === $status_code ) {
 				$this->log( 'Auth rejected (401). Pairing may be invalid.' );
+				$this->record_poll_error( 'Auth rejected (401). Pairing may be invalid — try disconnecting and pairing again.' );
 			} else {
 				$this->log( "Unexpected status {$status_code}" );
+				$this->record_poll_error( sprintf( 'Poll returned HTTP %d.', (int) $status_code ) );
 			}
 			$this->degraded = true;
 			return false;
@@ -374,11 +432,15 @@ class Felix_Runner {
 		if ( ! $command || ! isset( $command['commandId'] ) ) {
 			// Empty body or no command = "no command" response.
 			if ( empty( $raw_body ) || $raw_body === '{"command":null}' ) {
+				$this->clear_poll_error();
 				return true;
 			}
 			$this->log( 'Invalid command body.' );
+			$this->record_poll_error( 'Poll returned an invalid command body.' );
 			return false;
 		}
+
+		$this->clear_poll_error();
 
 		// Delegate to the shared processor. The poll path then posts the
 		// terminal result back to Felix — direct REST path does not.

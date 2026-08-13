@@ -4,7 +4,7 @@ Tags: woocommerce, customer service, ai, automation, ecommerce
 Requires at least: 6.0
 Tested up to: 6.5
 Requires PHP: 8.1
-Stable tag: 0.4.1
+Stable tag: 0.4.2
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -70,7 +70,17 @@ At pairing, the plugin generates an Ed25519 keypair. The private key never leave
 
 = Do I need to set up a scheduled task? =
 
-No. The connector runs automatically via WordPress's built-in scheduler, which fires whenever people visit your site. In rare cases (very low-traffic sites, or DISABLE_WP_CRON set in wp-config.php), a scheduled task — also called a cron job — may be needed. The plugin will detect this and show step-by-step instructions on the settings page.
+Usually no. The connector runs automatically via WordPress's built-in scheduler, which fires whenever people visit your site. You **do** need a scheduled task if:
+
+* `DISABLE_WP_CRON` is set in wp-config.php (common on staging and some hosts)
+* The site has very little traffic
+* WordPress is in Safe Mode / a maintenance plugin is blocking cron
+
+The plugin detects `DISABLE_WP_CRON` and shows a working `wp-cron.php` command on the settings page. Do not point a cron job at `runner.php` unless that file is actually installed (older ZIPs omitted it and the path 404'd).
+
+= My store is stuck on Connecting… =
+
+Click **Check in now** on WooCommerce → Felix Connector. That runs one poll immediately. If WordPress's built-in scheduler is disabled, also add the `wp-cron.php` scheduled task from the settings page so the connection stays alive.
 
 = Can I disable specific actions? =
 
@@ -78,17 +88,30 @@ Yes. Go to WooCommerce → Felix Connector → Command Permissions and check any
 
 == Advanced: Scheduled Task (Optional) ==
 
-For high-reliability or low-traffic setups, you can optionally add a scheduled task (a small instruction that tells your web host to run something automatically on a timer) to run the connector independently of site traffic. This replaces (or supplements) the WordPress built-in scheduler.
+For high-reliability, low-traffic, staging, or `DISABLE_WP_CRON` setups, add a scheduled task that hits WordPress cron every 5 minutes. This works even when `DISABLE_WP_CRON` is set (that flag only blocks spawn-on-page-view, not the HTTP endpoint):
 
-Copy the cron command from WooCommerce → Felix Connector → Advanced & Troubleshooting, then add it to your server:
+    wget -q -O - https://YOUR-STORE-URL/wp-cron.php?doing_wp_cron >/dev/null 2>&1
+
+Copy the exact command from WooCommerce → Felix Connector → Advanced & Troubleshooting.
 
 * **SiteGround:** Site Tools → Devs → Cron Jobs → Add New. Set to run every 5 minutes.
 * **cPanel:** Advanced → Cron Jobs. Set to */5 in the minute field, * in all others.
 * **WP-CLI / SSH:** Add to your crontab with a 5-minute schedule.
 
-A scheduled task and the WordPress built-in scheduler can coexist safely — they share a lock so commands are never double-executed.
+Optional: if `runner.php` is present in the plugin directory, you can instead run it via PHP CLI. A scheduled task and the WordPress built-in scheduler can coexist safely — they share a lock so commands are never double-executed.
 
 == Changelog ==
+
+= 0.4.2 =
+* Fix: ship `runner.php` in the release ZIP (it was missing from v0.4.0, so advertised cron paths 404'd)
+* New: **Check in now** button runs one short poll immediately (same pipeline as WP-Cron)
+* Fix: honest Connecting copy when `DISABLE_WP_CRON` is set — no false “page view already triggered”
+* Fix: cron fallback advertises a working `wp-cron.php` command; PHP CLI `runner.php` is shown only when that file is installed
+* New: one short poll right after a successful pair
+* New: diagnostics show last run status, heartbeat, last poll error, and whether `runner.php` is present
+* New: download connector log from Advanced & Troubleshooting
+* New: CI fails if UI-referenced files (including `runner.php`) are missing from the ZIP
+* Docs: `DISABLE_WP_CRON` / staging / Safe Mode troubleshooting
 
 = 0.4.1 =
 * Cross-language canonical JSON fixture: adds an astral-key (non-BMP) ordering case proving Node's canonical encoder now sorts object keys by UTF-8 byte value, matching PHP `ksort` byte-for-byte. No runtime behavior change for BMP keys (the realistic command-envelope case); astral keys now verify correctly where UTF-16 code-unit ordering previously diverged.

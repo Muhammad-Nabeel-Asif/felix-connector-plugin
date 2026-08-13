@@ -1704,6 +1704,70 @@ function test_pairing_code_normalization() {
 	expect( 'canonical alphabet excludes 1', false === strpos( $sample, '1' ) );
 }
 
+/**
+ * Release ZIP contract: every file the settings UI / cron docs reference
+ * must exist on disk. A ZIP that omitted runner.php 404'd on staging and
+ * left stores stuck on Connecting… when DISABLE_WP_CRON was set.
+ */
+function test_required_release_files_present() {
+	echo "\n[required release files present on disk]\n";
+	$files = Felix_Settings::required_release_files();
+	expect( 'runner.php is in the required-files list', in_array( 'runner.php', $files, true ) );
+	foreach ( $files as $rel ) {
+		expect( "release file exists: {$rel}", is_readable( FELIX_CONNECTOR_PLUGIN_DIR . $rel ) );
+	}
+	expect( 'runner_file_present() is true in this checkout', Felix_Settings::runner_file_present() );
+}
+
+/**
+ * Cron fallback + Connecting copy: never advertise a missing runner.php
+ * path, and never claim a page view already triggered check-in.
+ */
+function test_cron_fallback_and_connecting_copy() {
+	echo "\n[cron fallback + honest Connecting copy]\n";
+
+	$cmd = Felix_Settings::wp_cron_http_command( 'https://staging9.shop.example.com' );
+	expect( 'wp-cron command uses wget', 0 === strpos( $cmd, 'wget' ) );
+	expect( 'wp-cron command hits wp-cron.php', false !== strpos( $cmd, 'wp-cron.php?doing_wp_cron' ) );
+	expect( 'wp-cron command uses the store host', false !== strpos( $cmd, 'staging9.shop.example.com' ) );
+	expect( 'wp-cron command does not mention runner.php', false === strpos( $cmd, 'runner.php' ) );
+
+	$php = Felix_Settings::php_runner_command();
+	expect( 'php runner command includes runner.php when the file exists', false !== strpos( $php, 'runner.php' ) );
+
+	$disabled = Felix_Settings::connecting_notice( true );
+	expect( 'disabled-cron notice names DISABLE_WP_CRON', false !== strpos( $disabled, 'DISABLE_WP_CRON' ) );
+	expect( 'disabled-cron notice does not claim page view triggered', false === strpos( strtolower( $disabled ), 'page view has already' ) );
+	expect( 'disabled-cron notice points at Check in now', false !== strpos( $disabled, 'Check in now' ) );
+
+	$enabled = Felix_Settings::connecting_notice( false );
+	expect( 'enabled-cron notice does not claim already triggered', false === strpos( strtolower( $enabled ), 'already triggered' ) );
+	expect( 'enabled-cron notice offers Check in now', false !== strpos( $enabled, 'Check in now' ) );
+}
+
+/**
+ * Pairing error copy: already-used / expired / not-found are explicit.
+ */
+function test_pair_error_copy() {
+	echo "\n[pairing error copy]\n";
+	expect(
+		'already used is explicit',
+		false !== strpos( Felix_Settings::format_pair_error( 400, array( 'message' => 'Pairing code already used' ) ), 'already used' )
+	);
+	expect(
+		'expired is explicit',
+		false !== strpos( Felix_Settings::format_pair_error( 400, array( 'message' => 'Pairing code expired' ) ), 'expired' )
+	);
+	expect(
+		'not found is explicit',
+		false !== strpos( Felix_Settings::format_pair_error( 404, array( 'message' => 'Pairing code not found' ) ), 'not found' )
+	);
+	expect(
+		'HTTP 404 without body still names not found',
+		false !== strpos( Felix_Settings::format_pair_error( 404, array() ), 'not found' )
+	);
+}
+
 // =============================================================================
 // RUN
 // =============================================================================
@@ -1730,6 +1794,9 @@ test_fresh_conflict_then_later_terminal_retrieval();
 test_renew_handler_registered();
 test_authorization_basis_object_form();
 test_pairing_code_normalization();
+test_required_release_files_present();
+test_cron_fallback_and_connecting_copy();
+test_pair_error_copy();
 
 // v0.4.1 command-surface parity.
 test_command_surface_parity();

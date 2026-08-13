@@ -20,7 +20,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 // --- Plugin constants (mirror felix-connector.php) ---------------------------
-define( 'FELIX_CONNECTOR_VERSION', '0.4.1' );
+define( 'FELIX_CONNECTOR_VERSION', '0.4.2' );
 define( 'FELIX_CONNECTOR_PLUGIN_FILE', __FILE__ );
 define( 'FELIX_CONNECTOR_PLUGIN_DIR', __DIR__ . '/../' );
 define( 'FELIX_CONNECTOR_PLUGIN_URL', '' );
@@ -39,6 +39,7 @@ define( 'FELIX_OPT_RUNNER_HEARTBEAT', 'felix_runner_heartbeat' );
 define( 'FELIX_OPT_RUNNER_LEASE', 'felix_runner_lease' );
 define( 'FELIX_OPT_SEEN_NONCES', 'felix_seen_nonces' );
 define( 'FELIX_OPT_LIVENESS_STATE', 'felix_liveness_state' );
+define( 'FELIX_OPT_LAST_POLL_ERROR', 'felix_last_poll_error' );
 
 if ( ! defined( 'FELIX_API_BASE' ) ) {
 	define( 'FELIX_API_BASE', 'https://api.test.local' );

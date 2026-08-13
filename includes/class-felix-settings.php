@@ -48,6 +48,12 @@ class Felix_Settings {
 			case 'save_switches':
 				$this->handle_save_switches();
 				break;
+			case 'checkin':
+				$this->handle_checkin();
+				break;
+			case 'download_log':
+				$this->handle_download_log();
+				break;
 		}
 	}
 
@@ -104,7 +110,17 @@ class Felix_Settings {
 		);
 
 		if ( is_wp_error( $response ) ) {
-			add_settings_error( 'felix_connector', 'pair_failed', sprintf( __( 'Connection failed: %s', 'felix-connector' ), $response->get_error_message() ), 'error' );
+			add_settings_error(
+				'felix_connector',
+				'pair_failed',
+				sprintf(
+					/* translators: 1: error message, 2: API base URL */
+					__( 'Could not reach Felix (%1$s). Check that this server can make outbound HTTPS requests to %2$s.', 'felix-connector' ),
+					$response->get_error_message(),
+					FELIX_API_BASE
+				),
+				'error'
+			);
 			return;
 		}
 
@@ -112,8 +128,7 @@ class Felix_Settings {
 		$response_body = json_decode( wp_remote_retrieve_body( $response ), true );
 
 		if ( $code !== 200 ) {
-			$error_msg = $response_body['message'] ?? $response_body['error'] ?? __( 'Unknown error', 'felix-connector' );
-			add_settings_error( 'felix_connector', 'pair_error', sprintf( __( 'Pairing failed: %s', 'felix-connector' ), $error_msg ), 'error' );
+			add_settings_error( 'felix_connector', 'pair_error', self::format_pair_error( $code, $response_body ), 'error' );
 			return;
 		}
 
@@ -127,7 +142,15 @@ class Felix_Settings {
 		update_option( FELIX_OPT_PAIRED, true, false );
 		update_option( FELIX_OPT_LIVENESS_STATE, 'pairing', false );
 
-		add_settings_error( 'felix_connector', 'pair_success', __( 'Store connected to Felix! The connector will activate automatically — usually within seconds.', 'felix-connector' ), 'updated' );
+		// Immediate short check-in so Felix sees lastSeenAt without waiting for cron.
+		$checkin_status = function_exists( 'felix_connector_checkin_now' )
+			? felix_connector_checkin_now()
+			: 'skipped';
+		if ( 'success' === $checkin_status ) {
+			add_settings_error( 'felix_connector', 'pair_success', __( 'Store connected to Felix. Check-in succeeded.', 'felix-connector' ), 'updated' );
+		} else {
+			add_settings_error( 'felix_connector', 'pair_success', __( 'Store paired with Felix. Click Check in now if status stays on Connecting… — a page view will not connect the store when the WordPress scheduler is disabled.', 'felix-connector' ), 'updated' );
+		}
 	}
 
 	/**
@@ -166,6 +189,7 @@ class Felix_Settings {
 		delete_option( FELIX_OPT_LIVENESS_STATE );
 		delete_option( FELIX_OPT_RUNNER_HEARTBEAT );
 		delete_option( FELIX_OPT_SEEN_NONCES );
+		delete_option( FELIX_OPT_LAST_POLL_ERROR );
 		delete_option( 'felix_last_run_at' );
 		delete_option( 'felix_last_run_status' );
 
@@ -176,6 +200,93 @@ class Felix_Settings {
 		$killed = isset( $_POST['kill_switches'] ) ? array_map( 'sanitize_text_field', wp_unslash( $_POST['kill_switches'] ) ) : array();
 		update_option( FELIX_OPT_KILL_SWITCHES, $killed, false );
 		add_settings_error( 'felix_connector', 'switches_saved', __( 'Command permissions updated.', 'felix-connector' ), 'updated' );
+	}
+
+	/**
+	 * Admin "Check in now" — one short poll via the shared runner pipeline.
+	 */
+	private function handle_checkin() {
+		$status = function_exists( 'felix_connector_checkin_now' )
+			? felix_connector_checkin_now()
+			: 'skipped';
+		if ( 'success' === $status ) {
+			add_settings_error( 'felix_connector', 'checkin_ok', __( 'Check-in succeeded. Felix should show Connected shortly.', 'felix-connector' ), 'updated' );
+			return;
+		}
+		if ( 'skipped' === $status ) {
+			add_settings_error( 'felix_connector', 'checkin_skip', __( 'Check-in skipped — another runner is already active, or the store is not paired.', 'felix-connector' ), 'info' );
+			return;
+		}
+		$err = get_option( FELIX_OPT_LAST_POLL_ERROR, array() );
+		$msg = is_array( $err ) && ! empty( $err['message'] )
+			? $err['message']
+			: __( 'Unknown poll error. See Advanced & Troubleshooting.', 'felix-connector' );
+		add_settings_error(
+			'felix_connector',
+			'checkin_fail',
+			sprintf(
+				/* translators: %s: last poll error */
+				__( 'Check-in failed: %s', 'felix-connector' ),
+				$msg
+			),
+			'error'
+		);
+	}
+
+	/**
+	 * Stream the connector log file as a download.
+	 */
+	private function handle_download_log() {
+		$path = WP_CONTENT_DIR . '/uploads/felix-connector.log';
+		if ( ! is_readable( $path ) ) {
+			add_settings_error( 'felix_connector', 'no_log', __( 'No connector log file yet. It is created the first time the runner runs.', 'felix-connector' ), 'error' );
+			return;
+		}
+		if ( function_exists( 'nocache_headers' ) ) {
+			nocache_headers();
+		}
+		header( 'Content-Type: text/plain; charset=utf-8' );
+		header( 'Content-Disposition: attachment; filename="felix-connector.log"' );
+		header( 'Content-Length: ' . (string) filesize( $path ) );
+		readfile( $path );
+		exit;
+	}
+
+	/**
+	 * Map backend pairing HTTP errors to operator-facing copy.
+	 *
+	 * @param int   $code
+	 * @param mixed $response_body
+	 * @return string
+	 */
+	public static function format_pair_error( $code, $response_body ) {
+		$backend = '';
+		if ( is_array( $response_body ) ) {
+			$backend = (string) ( $response_body['message'] ?? $response_body['error'] ?? '' );
+		}
+
+		$lower = strtolower( $backend );
+		if ( false !== strpos( $lower, 'already used' ) ) {
+			return __( 'That pairing code was already used. Mint a new code in Felix and try again.', 'felix-connector' );
+		}
+		if ( false !== strpos( $lower, 'expired' ) ) {
+			return __( 'That pairing code has expired. Mint a new code in Felix and try again.', 'felix-connector' );
+		}
+		if ( false !== strpos( $lower, 'not found' ) || 404 === (int) $code ) {
+			return __( 'That pairing code was not found. Check you typed it exactly as shown in Felix, or mint a new one.', 'felix-connector' );
+		}
+		if ( $backend ) {
+			return sprintf(
+				/* translators: %s: backend error message */
+				__( 'Pairing failed: %s', 'felix-connector' ),
+				$backend
+			);
+		}
+		return sprintf(
+			/* translators: %d: HTTP status */
+			__( 'Pairing failed (HTTP %d). Mint a new code in Felix and try again.', 'felix-connector' ),
+			(int) $code
+		);
 	}
 
 	private function gather_environment() {
@@ -217,12 +328,94 @@ class Felix_Settings {
 	}
 
 	/**
+	 * Files that MUST ship in the release ZIP. The settings UI and cron docs
+	 * reference these by path; CI fails the build if any are missing.
+	 *
+	 * @return string[] Paths relative to the plugin root.
+	 */
+	public static function required_release_files() {
+		return array(
+			'felix-connector.php',
+			'runner.php',
+			'uninstall.php',
+			'readme.txt',
+			'includes/class-felix-settings.php',
+			'includes/class-felix-runner.php',
+			'includes/class-felix-pairing.php',
+			'includes/class-felix-crypto.php',
+			'includes/class-felix-command-handlers.php',
+			'includes/class-felix-command-processor.php',
+			'includes/class-felix-command-ledger.php',
+			'includes/class-felix-rest.php',
+		);
+	}
+
+	/**
+	 * Absolute path of the CLI runner entry point.
+	 *
+	 * @return string
+	 */
+	public static function runner_file_path() {
+		return FELIX_CONNECTOR_PLUGIN_DIR . 'runner.php';
+	}
+
+	/**
+	 * Whether runner.php is actually on disk (false if a ZIP omitted it).
+	 *
+	 * @return bool
+	 */
+	public static function runner_file_present() {
+		return is_readable( self::runner_file_path() );
+	}
+
+	/**
+	 * wget command that hits wp-cron.php. Works even when DISABLE_WP_CRON is
+	 * set (that flag only blocks spawn-on-page-view, not the HTTP endpoint).
+	 *
+	 * @param string $home_url Site home URL.
+	 * @return string
+	 */
+	public static function wp_cron_http_command( $home_url ) {
+		$url = rtrim( (string) $home_url, '/' ) . '/wp-cron.php?doing_wp_cron';
+		return 'wget -q -O - ' . escapeshellarg( $url ) . ' >/dev/null 2>&1';
+	}
+
+	/**
+	 * PHP CLI command for runner.php. Empty string if the file is missing.
+	 *
+	 * @return string
+	 */
+	public static function php_runner_command() {
+		if ( ! self::runner_file_present() ) {
+			return '';
+		}
+		$php_binary  = defined( 'PHP_BINARY' ) ? PHP_BINARY : 'php';
+		$runner_path = self::runner_file_path();
+		return "{$php_binary} {$runner_path} >/dev/null 2>&1";
+	}
+
+	/**
+	 * Honest Connecting… copy. Never claims a page view already triggered
+	 * check-in — that is false when DISABLE_WP_CRON is set.
+	 *
+	 * @param bool $wp_cron_disabled
+	 * @return string
+	 */
+	public static function connecting_notice( $wp_cron_disabled ) {
+		if ( $wp_cron_disabled ) {
+			return __( 'WordPress\'s built-in scheduler is disabled (DISABLE_WP_CRON), so visiting this page will not connect Felix. Click Check in now, or add a scheduled task using the command below.', 'felix-connector' );
+		}
+		return __( 'Felix connects automatically when someone visits your site. You can also click Check in now to check in immediately.', 'felix-connector' );
+	}
+
+	/**
 	 * Get the cron command with the correct PHP binary and path.
+	 *
+	 * @deprecated 0.4.2 Use php_runner_command() / wp_cron_http_command().
 	 */
 	private function get_cron_command() {
-		$php_binary  = PHP_BINARY;
-		$runner_path = FELIX_CONNECTOR_PLUGIN_DIR . 'runner.php';
-		return "{$php_binary} {$runner_path} >/dev/null 2>&1";
+		$php = self::php_runner_command();
+		return '' !== $php ? $php : self::wp_cron_http_command( home_url() );
 	}
 
 	/**
@@ -257,7 +450,7 @@ class Felix_Settings {
 				'status'             => 'connected',
 				'color'              => 'green',
 				'label'              => __( 'Connected', 'felix-connector' ),
-				'show_cron_fallback' => false,
+				'show_cron_fallback' => $wp_cron_disabled,
 			);
 		}
 
@@ -285,7 +478,6 @@ class Felix_Settings {
 	public function render_page() {
 		$paired    = get_option( FELIX_OPT_PAIRED, false );
 		$store_id  = get_option( FELIX_OPT_STORE_ID, '' );
-		$liveness  = get_option( FELIX_OPT_LIVENESS_STATE, 'unknown' );
 		$heartbeat = get_option( FELIX_OPT_RUNNER_HEARTBEAT, 0 );
 		$killed    = get_option( FELIX_OPT_KILL_SWITCHES, array() );
 
@@ -311,7 +503,12 @@ class Felix_Settings {
 			'refund'              => __( 'Process refunds', 'felix-connector' ),
 		);
 
-		$cron_command = $this->get_cron_command();
+		$cron_http_command = self::wp_cron_http_command( home_url() );
+		$cron_php_command  = self::php_runner_command();
+		$runner_present    = self::runner_file_present();
+		$last_poll_error   = get_option( FELIX_OPT_LAST_POLL_ERROR, array() );
+		$log_path          = WP_CONTENT_DIR . '/uploads/felix-connector.log';
+		$log_exists        = is_readable( $log_path );
 
 		settings_errors( 'felix_connector' );
 		?>
@@ -379,39 +576,53 @@ class Felix_Settings {
 							<th><?php esc_html_e( 'Store ID', 'felix-connector' ); ?></th>
 							<td><code><?php echo esc_html( $store_id ); ?></code></td>
 						</tr>
-						<?php if ( $last_run > 0 ) : ?>
 						<tr>
 							<th><?php esc_html_e( 'Last activity', 'felix-connector' ); ?></th>
 							<td>
 								<?php
-								$run_age = time() - $last_run;
-								if ( $run_age < 60 ) {
-									echo esc_html( sprintf( __( '%d seconds ago', 'felix-connector' ), $run_age ) );
-								} elseif ( $run_age < 3600 ) {
-									echo esc_html( sprintf( __( '%d minutes ago', 'felix-connector' ), intval( $run_age / 60 ) ) );
+								if ( $last_run > 0 ) {
+									$run_age = time() - $last_run;
+									if ( $run_age < 60 ) {
+										echo esc_html( sprintf( __( '%d seconds ago', 'felix-connector' ), $run_age ) );
+									} elseif ( $run_age < 3600 ) {
+										echo esc_html( sprintf( __( '%d minutes ago', 'felix-connector' ), intval( $run_age / 60 ) ) );
+									} else {
+										echo esc_html( sprintf( __( '%d hours ago', 'felix-connector' ), intval( $run_age / 3600 ) ) );
+									}
+									if ( $last_status ) {
+										echo ' <code>' . esc_html( $last_status ) . '</code>';
+									}
 								} else {
-									echo esc_html( sprintf( __( '%d hours ago', 'felix-connector' ), intval( $run_age / 3600 ) ) );
+									esc_html_e( 'Never — click Check in now', 'felix-connector' );
 								}
 								?>
 							</td>
 						</tr>
-						<?php endif; ?>
 					</table>
 
 					<?php if ( 'connecting' === $conn['status'] ) : ?>
 						<p style="margin-top: 10px; padding: 10px; background: #e8f4fd; border-left: 4px solid #2271b1;">
-							ℹ️ <?php esc_html_e( 'Felix connects automatically — no setup needed. This page view has already triggered the connection; it should update shortly.', 'felix-connector' ); ?>
+							ℹ️ <?php echo esc_html( self::connecting_notice( $wp_cron_disabled ) ); ?>
 						</p>
+						<?php if ( ! $wp_cron_disabled ) : ?>
 						<script>
-							setTimeout(function() { window.location.reload(); }, 5000);
+							setTimeout(function() { window.location.reload(); }, 8000);
 						</script>
+						<?php endif; ?>
 					<?php endif; ?>
 
-					<form method="post" action="" style="margin-top: 15px;">
-						<?php wp_nonce_field( 'felix_connector_settings' ); ?>
-						<input type="hidden" name="felix_action" value="unpair">
-						<?php submit_button( __( 'Disconnect from Felix', 'felix-connector' ), 'delete', 'submit', false ); ?>
-					</form>
+					<div style="margin-top: 15px; display: flex; gap: 8px; flex-wrap: wrap;">
+						<form method="post" action="" style="display: inline;">
+							<?php wp_nonce_field( 'felix_connector_settings' ); ?>
+							<input type="hidden" name="felix_action" value="checkin">
+							<?php submit_button( __( 'Check in now', 'felix-connector' ), 'primary', 'submit', false ); ?>
+						</form>
+						<form method="post" action="" style="display: inline;">
+							<?php wp_nonce_field( 'felix_connector_settings' ); ?>
+							<input type="hidden" name="felix_action" value="unpair">
+							<?php submit_button( __( 'Disconnect from Felix', 'felix-connector' ), 'delete', 'submit', false ); ?>
+						</form>
+					</div>
 				</div>
 
 				<?php
@@ -424,20 +635,31 @@ class Felix_Settings {
 					<h2>⚙️ <?php esc_html_e( 'Add a Scheduled Task for Reliable Operation', 'felix-connector' ); ?></h2>
 
 					<?php if ( $wp_cron_disabled ) : ?>
-						<p><?php esc_html_e( 'Your WordPress site has DISABLE_WP_CRON set, which prevents the connector from running automatically. Add a scheduled task — a small instruction that tells your web host to run something automatically on a timer — to keep Felix connected.', 'felix-connector' ); ?></p>
+						<p><?php esc_html_e( 'Your WordPress site has DISABLE_WP_CRON set, which prevents the connector from running on page views. Add a scheduled task that hits wp-cron.php every 5 minutes — that endpoint still works when the built-in scheduler is disabled.', 'felix-connector' ); ?></p>
 					<?php else : ?>
 						<p><?php esc_html_e( 'Your site appears to have low traffic or the WordPress built-in scheduler (which runs automatically whenever people visit your site) is not firing reliably. Adding a scheduled task — also called a cron job — ensures Felix stays connected.', 'felix-connector' ); ?></p>
 					<?php endif; ?>
 
-					<p><?php esc_html_e( 'Copy this command:', 'felix-connector' ); ?></p>
+					<p><strong><?php esc_html_e( 'Recommended (works on any host, including when DISABLE_WP_CRON is set):', 'felix-connector' ); ?></strong></p>
 					<p>
-						<input type="text" readonly id="felix-cron-command" class="large-text code" value="<?php echo esc_attr( $cron_command ); ?>" style="font-family: monospace; font-size: 13px;">
+						<input type="text" readonly id="felix-cron-command" class="large-text code" value="<?php echo esc_attr( $cron_http_command ); ?>" style="font-family: monospace; font-size: 13px;">
 					</p>
 					<p>
 						<button type="button" class="button button-secondary" onclick="var e=document.getElementById('felix-cron-command');e.select();document.execCommand('copy');this.textContent='Copied!';">
 							📋 <?php esc_html_e( 'Copy Command', 'felix-connector' ); ?>
 						</button>
 					</p>
+
+					<?php if ( $runner_present && '' !== $cron_php_command ) : ?>
+						<p style="margin-top: 15px;"><strong><?php esc_html_e( 'Optional (PHP CLI runner — more reliable on low-traffic sites):', 'felix-connector' ); ?></strong></p>
+						<p>
+							<input type="text" readonly id="felix-cron-php-command" class="large-text code" value="<?php echo esc_attr( $cron_php_command ); ?>" style="font-family: monospace; font-size: 13px;">
+						</p>
+					<?php else : ?>
+						<p style="margin-top: 15px; padding: 10px; background: #fcf0f1; border-left: 4px solid #d63638;">
+							<?php esc_html_e( 'The PHP CLI runner (runner.php) is not installed in this plugin copy. Use the wp-cron.php command above — do not add a cron job that points at a missing runner.php path.', 'felix-connector' ); ?>
+						</p>
+					<?php endif; ?>
 
 					<details style="margin-top: 15px;">
 						<summary style="cursor: pointer; font-weight: bold;"><?php esc_html_e( 'How to add the scheduled task', 'felix-connector' ); ?></summary>
@@ -480,8 +702,12 @@ class Felix_Settings {
 					<summary style="cursor: pointer; font-size: 14px; color: #2271b1; font-weight: bold;"><?php esc_html_e( 'Advanced & Troubleshooting', 'felix-connector' ); ?></summary>
 					<div class="card" style="margin-top: 10px;">
 						<h3><?php esc_html_e( 'Advanced: Scheduled Task (Optional)', 'felix-connector' ); ?></h3>
-						<p><?php esc_html_e( 'For high-reliability setups, you can optionally add a scheduled task (a small instruction that tells your web host to run something automatically on a timer) to run the connector independently of site traffic. This is not required for normal operation.', 'felix-connector' ); ?></p>
-						<p><input type="text" readonly class="large-text code" value="<?php echo esc_attr( $cron_command ); ?>" style="font-family: monospace; font-size: 13px;" onclick="this.select();"></p>
+						<p><?php esc_html_e( 'For high-reliability setups, add a scheduled task that hits wp-cron.php every 5 minutes. This is required when DISABLE_WP_CRON is set, and recommended for staging or low-traffic sites.', 'felix-connector' ); ?></p>
+						<p><input type="text" readonly class="large-text code" value="<?php echo esc_attr( $cron_http_command ); ?>" style="font-family: monospace; font-size: 13px;" onclick="this.select();"></p>
+						<?php if ( $runner_present && '' !== $cron_php_command ) : ?>
+							<p><?php esc_html_e( 'PHP CLI runner (optional):', 'felix-connector' ); ?></p>
+							<p><input type="text" readonly class="large-text code" value="<?php echo esc_attr( $cron_php_command ); ?>" style="font-family: monospace; font-size: 13px;" onclick="this.select();"></p>
+						<?php endif; ?>
 
 						<hr style="margin: 20px 0;">
 
@@ -494,6 +720,63 @@ class Felix_Settings {
 										<span style="color: red;">⚠️ <?php esc_html_e( 'The built-in scheduler is disabled (DISABLE_WP_CRON is set). It will not fire on page loads.', 'felix-connector' ); ?></span>
 									<?php else : ?>
 										<span style="color: green;">✅ <?php esc_html_e( 'Active (runs automatically when people visit your site)', 'felix-connector' ); ?></span>
+									<?php endif; ?>
+								</td>
+							</tr>
+							<tr>
+								<th><?php esc_html_e( 'Last run', 'felix-connector' ); ?></th>
+								<td>
+									<?php
+									if ( $last_run > 0 ) {
+										echo esc_html( gmdate( 'Y-m-d H:i:s', $last_run ) ) . ' <code>' . esc_html( $last_status ? $last_status : 'unknown' ) . '</code>';
+									} else {
+										esc_html_e( 'Never', 'felix-connector' );
+									}
+									?>
+								</td>
+							</tr>
+							<tr>
+								<th><?php esc_html_e( 'Heartbeat', 'felix-connector' ); ?></th>
+								<td>
+									<?php
+									if ( $heartbeat > 0 ) {
+										echo esc_html(
+											sprintf(
+												/* translators: %d: seconds since last heartbeat */
+												__( '%d seconds ago', 'felix-connector' ),
+												$stale_seconds
+											)
+										);
+									} else {
+										esc_html_e( 'None yet', 'felix-connector' );
+									}
+									?>
+								</td>
+							</tr>
+							<tr>
+								<th><?php esc_html_e( 'Last poll error', 'felix-connector' ); ?></th>
+								<td>
+									<?php
+									if ( is_array( $last_poll_error ) && ! empty( $last_poll_error['message'] ) ) {
+										$err_age = isset( $last_poll_error['at'] ) ? ( time() - (int) $last_poll_error['at'] ) : 0;
+										echo '<span style="color:#d63638;">' . esc_html( $last_poll_error['message'] ) . '</span>';
+										if ( $err_age > 0 ) {
+											echo ' <span class="description">(' . esc_html( sprintf( __( '%d seconds ago', 'felix-connector' ), $err_age ) ) . ')</span>';
+										}
+									} else {
+										esc_html_e( 'None', 'felix-connector' );
+									}
+									?>
+								</td>
+							</tr>
+							<tr>
+								<th><?php esc_html_e( 'CLI runner.php', 'felix-connector' ); ?></th>
+								<td>
+									<?php if ( $runner_present ) : ?>
+										<span style="color: green;">✅ <?php esc_html_e( 'Installed', 'felix-connector' ); ?></span>
+										<code><?php echo esc_html( self::runner_file_path() ); ?></code>
+									<?php else : ?>
+										<span style="color: red;">⚠️ <?php esc_html_e( 'Missing from this install — use the wp-cron.php scheduled task, not a PHP CLI path.', 'felix-connector' ); ?></span>
 									<?php endif; ?>
 								</td>
 							</tr>
@@ -524,7 +807,16 @@ class Felix_Settings {
 							</tr>
 							<tr>
 								<th><?php esc_html_e( 'Log file', 'felix-connector' ); ?></th>
-								<td><code><?php echo esc_html( WP_CONTENT_DIR . '/uploads/felix-connector.log' ); ?></code></td>
+								<td>
+									<code><?php echo esc_html( $log_path ); ?></code>
+									<?php if ( $log_exists ) : ?>
+										<form method="post" action="" style="display:inline; margin-left: 8px;">
+											<?php wp_nonce_field( 'felix_connector_settings' ); ?>
+											<input type="hidden" name="felix_action" value="download_log">
+											<?php submit_button( __( 'Download log', 'felix-connector' ), 'secondary', 'submit', false ); ?>
+										</form>
+									<?php endif; ?>
+								</td>
 							</tr>
 						</table>
 					</div>
