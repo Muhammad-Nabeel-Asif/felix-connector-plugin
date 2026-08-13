@@ -360,7 +360,14 @@ class Felix_Runner {
 	private function poll_once() {
 		$store_id   = Felix_Pairing::get_store_id();
 		$generation = Felix_Pairing::get_generation();
-		$endpoint   = get_option( FELIX_OPT_POLL_ENDPOINT, FELIX_API_BASE . '/connector/poll' );
+		$api_base   = Felix_Settings::resolve_api_base();
+		$fallback   = ( '' !== $api_base ) ? $api_base . '/connector/poll' : '';
+		$endpoint   = get_option( FELIX_OPT_POLL_ENDPOINT, $fallback );
+		if ( ! $endpoint ) {
+			$this->log( 'Poll endpoint is not configured (set FELIX_API_BASE or complete pairing).' );
+			$this->record_poll_error( 'Poll endpoint is not configured.' );
+			return false;
+		}
 
 		$keypair = Felix_Pairing::get_keypair();
 		$secret  = Felix_Crypto::get_secret_key( $keypair['encryptedSecret'] );
@@ -579,7 +586,13 @@ class Felix_Runner {
 	private function post_result( $command_id, $status, $result = null, $error = null, $processor_txn_ids = array() ) {
 		$store_id   = Felix_Pairing::get_store_id();
 		$generation = Felix_Pairing::get_generation();
-		$endpoint   = get_option( FELIX_OPT_RESULT_ENDPOINT, FELIX_API_BASE . '/connector/result' );
+		$api_base   = Felix_Settings::resolve_api_base();
+		$fallback   = ( '' !== $api_base ) ? $api_base . '/connector/result' : '';
+		$endpoint   = get_option( FELIX_OPT_RESULT_ENDPOINT, $fallback );
+		if ( ! $endpoint ) {
+			$this->log( 'Result endpoint is not configured (set FELIX_API_BASE or complete pairing).' );
+			return;
+		}
 
 		$body = array(
 			'protocolVersion' => FELIX_PROTOCOL_VERSION,

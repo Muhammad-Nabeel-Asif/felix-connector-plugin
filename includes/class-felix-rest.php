@@ -67,9 +67,10 @@ class Felix_REST {
 	 * unsigned/tampered envelope is rejected before any side effect.
 	 *
 	 * Kept as a named method so the capability advertisement (poll headers)
-	 * and the endpoint exposure stay in sync: the route is only meaningful
-	 * once the store is paired, but we do not 404 pre-pairing to avoid
-	 * leaking pairing state to unauthenticated callers.
+	 * and the endpoint exposure stay in sync. Unpaired stores return a generic
+	 * HTTP 404 from the callback (no `not_paired` body) so pairing state is
+	 * not named in the JSON; a paired store still returns 400/422 for a
+	 * garbage envelope.
 	 *
 	 * @return bool
 	 */
@@ -84,17 +85,12 @@ class Felix_REST {
 	 * @return WP_REST_Response
 	 */
 	public function handle_command( $request ) {
-		// Do not reveal the endpoint on an unpaired store.
+		// Do not reveal pairing state to an unauthenticated caller (F-12).
+		// Generic 404 — no `not_paired` code. A paired store still returns
+		// 400/422 for a garbage body, which is an informational status-code
+		// oracle for a caller who already knows this WordPress origin.
 		if ( ! Felix_Pairing::is_paired() ) {
-			return new WP_REST_Response(
-				array(
-					'error' => array(
-						'code'    => 'not_paired',
-						'message' => 'Store is not paired',
-					),
-				),
-				404
-			);
+			return new WP_REST_Response( null, 404 );
 		}
 
 		$raw_body = $request->get_body();

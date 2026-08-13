@@ -88,15 +88,15 @@ Yes. Go to WooCommerce → Felix Connector → Command Permissions and check any
 
 == Advanced: Scheduled Task (Optional) ==
 
-For high-reliability, low-traffic, staging, or `DISABLE_WP_CRON` setups, add a scheduled task that hits WordPress cron every 5 minutes. This works even when `DISABLE_WP_CRON` is set (that flag only blocks spawn-on-page-view, not the HTTP endpoint):
+For high-reliability, low-traffic, staging, or `DISABLE_WP_CRON` setups, add a scheduled task that hits WordPress cron every 1 minute. Command TTL is 120 seconds, so a 5-minute host cron can miss delivery. This works even when `DISABLE_WP_CRON` is set (that flag only blocks spawn-on-page-view, not the HTTP endpoint):
 
     wget -q -O - https://YOUR-STORE-URL/wp-cron.php?doing_wp_cron >/dev/null 2>&1
 
 Copy the exact command from WooCommerce → Felix Connector → Advanced & Troubleshooting.
 
-* **SiteGround:** Site Tools → Devs → Cron Jobs → Add New. Set to run every 5 minutes.
-* **cPanel:** Advanced → Cron Jobs. Set to */5 in the minute field, * in all others.
-* **WP-CLI / SSH:** Add to your crontab with a 5-minute schedule.
+* **SiteGround:** Site Tools → Devs → Cron Jobs → Add New. Set to run every 1 minute.
+* **cPanel:** Advanced → Cron Jobs. Set every field to * (every minute).
+* **WP-CLI / SSH:** Add to your crontab with a 1-minute schedule.
 
 Optional: if `runner.php` is present in the plugin directory, you can instead run it via PHP CLI. A scheduled task and the WordPress built-in scheduler can coexist safely — they share a lock so commands are never double-executed.
 

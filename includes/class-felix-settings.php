@@ -90,6 +90,17 @@ class Felix_Settings {
 			update_option( FELIX_OPT_PLUGIN_KEYPAIR, $keypair, false );
 		}
 
+		$api_base = self::resolve_api_base();
+		if ( '' === $api_base ) {
+			add_settings_error(
+				'felix_connector',
+				'api_base_missing',
+				__( 'FELIX_API_BASE is not configured. Set it in wp-config.php to your Felix API origin (for production: https://api.agentfelix.ai), or set FELIX_ENVIRONMENT to production. Pairing was not sent.', 'felix-connector' ),
+				'error'
+			);
+			return;
+		}
+
 		$environment = $this->gather_environment();
 
 		$post_body = array(
@@ -101,7 +112,7 @@ class Felix_Settings {
 		);
 
 		$response = wp_remote_post(
-			FELIX_API_BASE . '/connector/pair',
+			$api_base . '/connector/pair',
 			array(
 				'headers' => array( 'Content-Type' => 'application/json' ),
 				'body'    => wp_json_encode( $post_body ),
@@ -117,7 +128,7 @@ class Felix_Settings {
 					/* translators: 1: error message, 2: API base URL */
 					__( 'Could not reach Felix (%1$s). Check that this server can make outbound HTTPS requests to %2$s.', 'felix-connector' ),
 					$response->get_error_message(),
-					FELIX_API_BASE
+					$api_base
 				),
 				'error'
 			);
@@ -134,9 +145,9 @@ class Felix_Settings {
 
 		update_option( FELIX_OPT_STORE_ID, sanitize_text_field( $response_body['storeId'] ), false );
 		update_option( FELIX_OPT_GENERATION, intval( $response_body['generation'] ), false );
-		update_option( FELIX_OPT_POLL_ENDPOINT, esc_url_raw( $response_body['pollEndpoint'] ?? FELIX_API_BASE . '/connector/poll' ), false );
-		update_option( FELIX_OPT_RESULT_ENDPOINT, esc_url_raw( $response_body['resultEndpoint'] ?? FELIX_API_BASE . '/connector/result' ), false );
-		update_option( FELIX_OPT_PUSH_ENDPOINT, esc_url_raw( $response_body['pushEndpoint'] ?? FELIX_API_BASE . '/connector/push' ), false );
+		update_option( FELIX_OPT_POLL_ENDPOINT, esc_url_raw( $response_body['pollEndpoint'] ?? $api_base . '/connector/poll' ), false );
+		update_option( FELIX_OPT_RESULT_ENDPOINT, esc_url_raw( $response_body['resultEndpoint'] ?? $api_base . '/connector/result' ), false );
+		update_option( FELIX_OPT_PUSH_ENDPOINT, esc_url_raw( $response_body['pushEndpoint'] ?? $api_base . '/connector/push' ), false );
 		update_option( FELIX_OPT_HOST_PROFILE, $response_body['hostProfile'] ?? array(), false );
 		update_option( FELIX_OPT_KEY_MANIFEST, $response_body['keyManifest'] ?? array(), false );
 		update_option( FELIX_OPT_PAIRED, true, false );
@@ -151,6 +162,40 @@ class Felix_Settings {
 		} else {
 			add_settings_error( 'felix_connector', 'pair_success', __( 'Store paired with Felix. Click Check in now if status stays on Connecting… — a page view will not connect the store when the WordPress scheduler is disabled.', 'felix-connector' ), 'updated' );
 		}
+	}
+
+	/**
+	 * Resolve the Felix API origin.
+	 *
+	 * Missing FELIX_API_BASE must NOT silently post pairing data to production.
+	 * An explicit `FELIX_API_BASE` always wins. Production default is used only
+	 * when `FELIX_ENVIRONMENT` is exactly `production`. Development, test,
+	 * staging, and unset environments fail closed (empty string).
+	 *
+	 * Arguments are injectable so tests never need to redefine constants or
+	 * contact the production endpoint.
+	 *
+	 * @param string|null $defined_base  FELIX_API_BASE value, or null to read the constant.
+	 * @param string|null $environment   FELIX_ENVIRONMENT value, or null to read the constant.
+	 * @return string Origin with no trailing slash, or '' when configuration is missing.
+	 */
+	public static function resolve_api_base( $defined_base = null, $environment = null ) {
+		if ( 0 === func_num_args() ) {
+			$defined_base = defined( 'FELIX_API_BASE' ) ? FELIX_API_BASE : null;
+		}
+		if ( func_num_args() < 2 ) {
+			$environment = defined( 'FELIX_ENVIRONMENT' ) ? FELIX_ENVIRONMENT : null;
+		}
+		if ( is_string( $defined_base ) ) {
+			$trim = trim( $defined_base );
+			if ( '' !== $trim ) {
+				return rtrim( $trim, '/' );
+			}
+		}
+		if ( is_string( $environment ) && 'production' === strtolower( trim( $environment ) ) ) {
+			return 'https://api.agentfelix.ai';
+		}
+		return '';
 	}
 
 	/**
@@ -663,7 +708,7 @@ class Felix_Settings {
 					<h2>⚙️ <?php esc_html_e( 'Add a Scheduled Task for Reliable Operation', 'felix-connector' ); ?></h2>
 
 					<?php if ( $wp_cron_disabled ) : ?>
-						<p><?php esc_html_e( 'Your WordPress site has DISABLE_WP_CRON set, which prevents the connector from running on page views. Add a scheduled task that hits wp-cron.php every 5 minutes — that endpoint still works when the built-in scheduler is disabled.', 'felix-connector' ); ?></p>
+						<p><?php esc_html_e( 'Your WordPress site has DISABLE_WP_CRON set, which prevents the connector from running on page views. Add a scheduled task that hits wp-cron.php every 1 minute — command TTL is 120 seconds, so a 5-minute host cron can miss delivery. That endpoint still works when the built-in scheduler is disabled.', 'felix-connector' ); ?></p>
 					<?php else : ?>
 						<p><?php esc_html_e( 'Your site appears to have low traffic or the WordPress built-in scheduler (which runs automatically whenever people visit your site) is not firing reliably. Adding a scheduled task — also called a cron job — ensures Felix stays connected.', 'felix-connector' ); ?></p>
 					<?php endif; ?>
@@ -692,9 +737,9 @@ class Felix_Settings {
 					<details style="margin-top: 15px;">
 						<summary style="cursor: pointer; font-weight: bold;"><?php esc_html_e( 'How to add the scheduled task', 'felix-connector' ); ?></summary>
 						<div style="margin-top: 10px; padding-left: 15px;">
-							<p><strong><?php esc_html_e( 'SiteGround:', 'felix-connector' ); ?></strong> <?php esc_html_e( 'Site Tools → Devs → Cron Jobs → Add New. Set to run every 5 minutes. Paste the command above.', 'felix-connector' ); ?></p>
-							<p><strong><?php esc_html_e( 'cPanel:', 'felix-connector' ); ?></strong> <?php esc_html_e( 'Advanced → Cron Jobs → Add New Cron Job. Set to */5 in the minute field, * in all others. Paste the command above.', 'felix-connector' ); ?></p>
-							<p><strong><?php esc_html_e( 'WP-CLI / SSH:', 'felix-connector' ); ?></strong> <?php esc_html_e( 'Run "crontab -e" and add the command with a 5-minute schedule.', 'felix-connector' ); ?></p>
+							<p><strong><?php esc_html_e( 'SiteGround:', 'felix-connector' ); ?></strong> <?php esc_html_e( 'Site Tools → Devs → Cron Jobs → Add New. Set to run every 1 minute. Paste the command above.', 'felix-connector' ); ?></p>
+							<p><strong><?php esc_html_e( 'cPanel:', 'felix-connector' ); ?></strong> <?php esc_html_e( 'Advanced → Cron Jobs → Add New Cron Job. Set every field to * (every minute). Paste the command above.', 'felix-connector' ); ?></p>
+							<p><strong><?php esc_html_e( 'WP-CLI / SSH:', 'felix-connector' ); ?></strong> <?php esc_html_e( 'Run "crontab -e" and add the command with a 1-minute schedule.', 'felix-connector' ); ?></p>
 						</div>
 					</details>
 				</div>
@@ -730,7 +775,7 @@ class Felix_Settings {
 					<summary style="cursor: pointer; font-size: 14px; color: #2271b1; font-weight: bold;"><?php esc_html_e( 'Advanced & Troubleshooting', 'felix-connector' ); ?></summary>
 					<div class="card" style="margin-top: 10px;">
 						<h3><?php esc_html_e( 'Advanced: Scheduled Task (Optional)', 'felix-connector' ); ?></h3>
-						<p><?php esc_html_e( 'For high-reliability setups, add a scheduled task that hits wp-cron.php every 5 minutes. This is required when DISABLE_WP_CRON is set, and recommended for staging or low-traffic sites.', 'felix-connector' ); ?></p>
+						<p><?php esc_html_e( 'For high-reliability setups, add a scheduled task that hits wp-cron.php every 1 minute. Command TTL is 120 seconds — a 5-minute host cron can miss delivery. This is required when DISABLE_WP_CRON is set, and recommended for staging or low-traffic sites.', 'felix-connector' ); ?></p>
 						<p><input type="text" readonly class="large-text code" value="<?php echo esc_attr( $cron_http_command ); ?>" style="font-family: monospace; font-size: 13px;" onclick="this.select();"></p>
 						<?php if ( $runner_present && '' !== $cron_php_command ) : ?>
 							<p><?php esc_html_e( 'PHP CLI runner (optional):', 'felix-connector' ); ?></p>

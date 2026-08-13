@@ -11,8 +11,10 @@
  * DISABLE_WP_CRON is set). It bootstraps WordPress, then runs the full
  * long-window poll loop. CLI only — HTTP requests receive 403.
  *
- * Usage in crontab:
- *   */5 * * * * /usr/bin/php /path/to/.../runner.php >/dev/null 2>&1
+ * Usage in crontab (every 1 minute — command TTL is 120s, so a 5-minute
+ * host schedule can miss the claim window. Do not write star-slash sequences
+ * inside this block comment — that closes PHP comments early and fatals CLI):
+ *   every 1 min: /usr/bin/php /path/to/.../runner.php >/dev/null 2>&1
  *
  * Prefer the wp-cron.php wget command from plugin settings when PHP CLI
  * is unavailable or this file is missing from an older ZIP.
