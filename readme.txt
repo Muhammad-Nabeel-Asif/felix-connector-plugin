@@ -2,7 +2,7 @@
 Contributors: agentfelix
 Tags: woocommerce, customer service, ai, automation, ecommerce
 Requires at least: 6.0
-Tested up to: 6.5
+Tested up to: 7.0
 Requires PHP: 8.1
 Stable tag: 0.4.3
 License: GPLv2 or later
@@ -101,6 +101,9 @@ Optional: if `runner.php` is present in the plugin directory, you can instead ru
 = 0.4.3 =
 * Fix: Connected status is keyed off poll-loop heartbeat, not skipped `last_run_at` (a skipped cron tick no longer looks Connected)
 * Fix: disconnecting clears the runner lease so a re-pair within ~60s can check in immediately
+* Fix: `list_orders` + `search_orders` use real WooCommerce queries (`billing_email` on HPOS and classic orders)
+* Fix: invalid money/qty refused as `validation_error` before WooCommerce is mutated; handlers catch `Throwable`
+* Fix: missing `FELIX_API_BASE` fails closed (no silent production pairing from local/staging)
 * Docs: production requires a 1-minute host poll; 5-minute host cron is unsafe vs 120s command TTL
 
 = 0.4.2 =
