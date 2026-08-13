@@ -2230,6 +2230,7 @@ function test_wp_cron_runner_interval_is_one_minute() {
 	expect( 'activation schedules felix_minute for runner', false !== strpos( $src, "wp_schedule_event( time(), 'felix_minute', 'felix_connector_cron' )" ) );
 	$settings = file_get_contents( FELIX_CONNECTOR_PLUGIN_DIR . 'includes/class-felix-settings.php' );
 	expect( 'settings recommend 1-minute host cron (TTL 120s)', false !== strpos( $settings, 'every 1 minute' ) );
+	expect( 'settings mark 5-minute host cron unsafe', false !== strpos( $settings, '5-minute host cron is unsafe' ) );
 	expect( 'settings do not recommend 5-minute host cron for command delivery', false === strpos( $settings, 'hits wp-cron.php every 5 minutes' ) );
 	expect( 'ensure_cron migrates onto felix_minute', false !== strpos( $src, "'felix_minute' === \$event->schedule" ) );
 	expect( 'runner is NOT scheduled as five_minutes', false === strpos( $src, "wp_schedule_event( time(), 'five_minutes', 'felix_connector_cron' )" ) );

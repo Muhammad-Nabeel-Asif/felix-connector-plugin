@@ -465,7 +465,7 @@ class Felix_Settings {
 		if ( $wp_cron_disabled ) {
 			return __( 'WordPress\'s built-in scheduler is disabled (DISABLE_WP_CRON), so visiting this page will not connect Felix. Click Check in now, or add a scheduled task using the command below.', 'felix-connector' );
 		}
-		return __( 'Felix connects automatically when someone visits your site. You can also click Check in now to check in immediately.', 'felix-connector' );
+		return __( 'Page visits can spawn WP-Cron, but production requires a scheduled task every 1 minute (command TTL is 120 seconds). Click Check in now to check in immediately.', 'felix-connector' );
 	}
 
 	/**
@@ -774,8 +774,8 @@ class Felix_Settings {
 				<details style="margin-top: 20px;">
 					<summary style="cursor: pointer; font-size: 14px; color: #2271b1; font-weight: bold;"><?php esc_html_e( 'Advanced & Troubleshooting', 'felix-connector' ); ?></summary>
 					<div class="card" style="margin-top: 10px;">
-						<h3><?php esc_html_e( 'Advanced: Scheduled Task (Optional)', 'felix-connector' ); ?></h3>
-						<p><?php esc_html_e( 'For high-reliability setups, add a scheduled task that hits wp-cron.php every 1 minute. Command TTL is 120 seconds — a 5-minute host cron can miss delivery. This is required when DISABLE_WP_CRON is set, and recommended for staging or low-traffic sites.', 'felix-connector' ); ?></p>
+						<h3><?php esc_html_e( 'Advanced: Scheduled Task (Required in production)', 'felix-connector' ); ?></h3>
+						<p><?php esc_html_e( 'Production requires a scheduled task that hits wp-cron.php every 1 minute. Felix poll must run every 60 seconds or faster. Command TTL is 120 seconds — a 5-minute host cron is unsafe and can miss delivery. Page-view WP-Cron alone is insufficient. This is also required when DISABLE_WP_CRON is set.', 'felix-connector' ); ?></p>
 						<p><input type="text" readonly class="large-text code" value="<?php echo esc_attr( $cron_http_command ); ?>" style="font-family: monospace; font-size: 13px;" onclick="this.select();"></p>
 						<?php if ( $runner_present && '' !== $cron_php_command ) : ?>
 							<p><?php esc_html_e( 'PHP CLI runner (optional):', 'felix-connector' ); ?></p>

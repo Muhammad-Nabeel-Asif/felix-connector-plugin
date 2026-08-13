@@ -21,7 +21,7 @@ Felix delivers commands to your store over one of two transports, both sharing t
 1. **Outbound long-poll (default, firewall-friendly):** your store initiates all communication to Felix — Felix never makes inbound requests to your store. This means the connector works behind any host firewall, captcha system, or security layer (SiteGround Anti-Bot, Cloudflare, Wordfence, and others).
 2. **Direct command delivery (faster, optional):** when the store is reachable from Felix, Felix POSTs signed commands directly to `POST /wp-json/felix/v1/command`. This removes poll latency. Your store advertises this capability during polling; Felix uses it when available and falls back to long-poll otherwise.
 
-The connector runs automatically via WordPress's built-in scheduler (which runs whenever people visit your site) — no server configuration needed. It activates on the first page visit after pairing and continues running in the background as long as your site receives traffic.
+**Production requirement:** Felix must poll at least once every 60 seconds. Command TTL is 120 seconds, so a 5-minute host cron is unsafe and can miss delivery. WordPress page-view WP-Cron alone is not enough. Add a host/system cron (or equivalent) every 1 minute that hits `wp-cron.php`, or run `runner.php` every 1 minute via PHP CLI.
 
 Felix executes typed, validated commands only. There is no generic executor — every action is a specific, hand-written handler. You can disable any command family at any time from the plugin settings.
 
@@ -50,9 +50,9 @@ Felix executes typed, validated commands only. There is no generic executor — 
 2. Activate the plugin.
 3. Go to WooCommerce → Felix Connector in your WordPress admin.
 4. Enter the pairing code from your Felix dashboard at [agentfelix.ai](https://agentfelix.ai).
-5. Done! The connector activates automatically within a few minutes.
+5. Add a scheduled task that runs every 1 minute (required in production). Copy the command from WooCommerce → Felix Connector.
 
-No server configuration or SSH access required. The connector runs via WordPress's built-in scheduler (which runs automatically whenever people visit your site) and activates on the first page visit after pairing.
+Page-view WP-Cron can help on busy stores but is not sufficient by itself. A 5-minute host cron is unsafe (command TTL is 120 seconds).
 
 == Frequently Asked Questions ==
 
@@ -70,13 +70,9 @@ At pairing, the plugin generates an Ed25519 keypair. The private key never leave
 
 = Do I need to set up a scheduled task? =
 
-Usually no. The connector runs automatically via WordPress's built-in scheduler, which fires whenever people visit your site. You **do** need a scheduled task if:
+**Yes, in production.** Felix must poll at least once every 60 seconds. Command TTL is 120 seconds. WordPress page-view WP-Cron alone is insufficient. A 5-minute host cron is unsafe and can expire commands before the next poll.
 
-* `DISABLE_WP_CRON` is set in wp-config.php (common on staging and some hosts)
-* The site has very little traffic
-* WordPress is in Safe Mode / a maintenance plugin is blocking cron
-
-The plugin detects `DISABLE_WP_CRON` and shows a working `wp-cron.php` command on the settings page. Do not point a cron job at `runner.php` unless that file is actually installed (older ZIPs omitted it and the path 404'd).
+Preferred: host/system cron (or equivalent) every 1 minute hitting `wp-cron.php`. Alternative: `runner.php` via PHP CLI every 1 minute. Copy the exact command from WooCommerce → Felix Connector. Do not point a cron job at `runner.php` unless that file is actually installed (older ZIPs omitted it and the path 404'd).
 
 = My store is stuck on Connecting… =
 
@@ -86,9 +82,9 @@ Click **Check in now** on WooCommerce → Felix Connector. That runs one poll im
 
 Yes. Go to WooCommerce → Felix Connector → Command Permissions and check any family you want to disable.
 
-== Advanced: Scheduled Task (Optional) ==
+== Advanced: Scheduled Task (Required in production) ==
 
-For high-reliability, low-traffic, staging, or `DISABLE_WP_CRON` setups, add a scheduled task that hits WordPress cron every 1 minute. Command TTL is 120 seconds, so a 5-minute host cron can miss delivery. This works even when `DISABLE_WP_CRON` is set (that flag only blocks spawn-on-page-view, not the HTTP endpoint):
+Add a scheduled task that hits WordPress cron every 1 minute. This is mandatory in production: Felix poll must run every ≤ 60 seconds. Command TTL is 120 seconds, so a 5-minute host cron is unsafe. Page-view WP-Cron alone is insufficient. This works even when `DISABLE_WP_CRON` is set (that flag only blocks spawn-on-page-view, not the HTTP endpoint):
 
     wget -q -O - https://YOUR-STORE-URL/wp-cron.php?doing_wp_cron >/dev/null 2>&1
 
@@ -105,6 +101,7 @@ Optional: if `runner.php` is present in the plugin directory, you can instead ru
 = 0.4.3 =
 * Fix: Connected status is keyed off poll-loop heartbeat, not skipped `last_run_at` (a skipped cron tick no longer looks Connected)
 * Fix: disconnecting clears the runner lease so a re-pair within ~60s can check in immediately
+* Docs: production requires a 1-minute host poll; 5-minute host cron is unsafe vs 120s command TTL
 
 = 0.4.2 =
 * Fix: ship `runner.php` in the release ZIP (it was missing from v0.4.0, so advertised cron paths 404'd)
