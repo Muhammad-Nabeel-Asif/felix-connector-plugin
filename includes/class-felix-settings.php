@@ -177,21 +177,36 @@ class Felix_Settings {
 		return $canonical;
 	}
 
+	/**
+	 * Option keys cleared on unpair. Includes the runner lease so a re-pair
+	 * within ~60s is not skipped by a leftover holder from the previous session.
+	 *
+	 * @return string[]
+	 */
+	public static function pairing_state_option_keys() {
+		return array(
+			FELIX_OPT_STORE_ID,
+			FELIX_OPT_GENERATION,
+			FELIX_OPT_PAIRED,
+			FELIX_OPT_POLL_ENDPOINT,
+			FELIX_OPT_RESULT_ENDPOINT,
+			FELIX_OPT_PUSH_ENDPOINT,
+			FELIX_OPT_HOST_PROFILE,
+			FELIX_OPT_KEY_MANIFEST,
+			FELIX_OPT_LIVENESS_STATE,
+			FELIX_OPT_RUNNER_HEARTBEAT,
+			FELIX_OPT_RUNNER_LEASE,
+			FELIX_OPT_SEEN_NONCES,
+			FELIX_OPT_LAST_POLL_ERROR,
+			'felix_last_run_at',
+			'felix_last_run_status',
+		);
+	}
+
 	private function handle_unpair() {
-		delete_option( FELIX_OPT_STORE_ID );
-		delete_option( FELIX_OPT_GENERATION );
-		delete_option( FELIX_OPT_PAIRED );
-		delete_option( FELIX_OPT_POLL_ENDPOINT );
-		delete_option( FELIX_OPT_RESULT_ENDPOINT );
-		delete_option( FELIX_OPT_PUSH_ENDPOINT );
-		delete_option( FELIX_OPT_HOST_PROFILE );
-		delete_option( FELIX_OPT_KEY_MANIFEST );
-		delete_option( FELIX_OPT_LIVENESS_STATE );
-		delete_option( FELIX_OPT_RUNNER_HEARTBEAT );
-		delete_option( FELIX_OPT_SEEN_NONCES );
-		delete_option( FELIX_OPT_LAST_POLL_ERROR );
-		delete_option( 'felix_last_run_at' );
-		delete_option( 'felix_last_run_status' );
+		foreach ( self::pairing_state_option_keys() as $key ) {
+			delete_option( $key );
+		}
 
 		add_settings_error( 'felix_connector', 'unpaired', __( 'Store disconnected from Felix.', 'felix-connector' ), 'updated' );
 	}
@@ -421,14 +436,17 @@ class Felix_Settings {
 	/**
 	 * Determine connection status for the UI.
 	 *
+	 * Connected is keyed off heartbeat (updated only inside the poll loop after
+	 * the lease is held), not last_run_at. Skipped runs stamp last_run_at in
+	 * older builds and must not look Connected.
+	 *
+	 * @param bool $paired
+	 * @param int  $heartbeat        Unix timestamp of last poll-loop heartbeat, or 0.
+	 * @param bool $wp_cron_disabled
+	 * @param int  $now              Unix timestamp (injectable for tests).
 	 * @return array {status: string, color: string, label: string, show_cron_fallback: bool}
 	 */
-	private function get_connection_status() {
-		$paired     = (bool) get_option( FELIX_OPT_PAIRED, false );
-		$last_run   = (int) get_option( 'felix_last_run_at', 0 );
-		$run_status = get_option( 'felix_last_run_status', '' );
-		$paired_at  = 0; // We don't track pairing timestamp separately; infer from options.
-
+	public static function connection_status_from_state( $paired, $heartbeat, $wp_cron_disabled, $now ) {
 		if ( ! $paired ) {
 			return array(
 				'status'             => 'not_paired',
@@ -438,33 +456,30 @@ class Felix_Settings {
 			);
 		}
 
-		// Check DISABLE_WP_CRON.
-		$wp_cron_disabled = defined( 'DISABLE_WP_CRON' ) && DISABLE_WP_CRON;
+		$heartbeat = (int) $heartbeat;
+		$now       = (int) $now;
+		$age       = $heartbeat > 0 ? ( $now - $heartbeat ) : -1;
 
-		$now = time();
-		$age = $last_run > 0 ? ( $now - $last_run ) : -1;
-
-		// Fresh run (< 15 min) — connected.
+		// Fresh poll-loop heartbeat (< 15 min) — actually talking to Felix.
 		if ( $age >= 0 && $age < 900 ) {
 			return array(
 				'status'             => 'connected',
 				'color'              => 'green',
 				'label'              => __( 'Connected', 'felix-connector' ),
-				'show_cron_fallback' => $wp_cron_disabled,
+				'show_cron_fallback' => (bool) $wp_cron_disabled,
 			);
 		}
 
-		// Paired but no run yet, or run < 2 hours old — "Connecting…".
+		// Paired but no heartbeat yet, or heartbeat < 2 hours old — "Connecting…".
 		if ( $age < 0 || ( $age >= 900 && $age < 7200 ) ) {
 			return array(
 				'status'             => 'connecting',
 				'color'              => 'blue',
 				'label'              => __( 'Connecting…', 'felix-connector' ),
-				'show_cron_fallback' => $wp_cron_disabled,
+				'show_cron_fallback' => (bool) $wp_cron_disabled,
 			);
 		}
 
-		// Run older than 2 hours (or never after 2+ hours) — show cron fallback.
 		return array(
 			'status'             => $wp_cron_disabled ? 'wp_cron_disabled' : 'stale',
 			'color'              => 'orange',
@@ -473,6 +488,19 @@ class Felix_Settings {
 				: __( 'Connection appears inactive — add a scheduled task to keep it running', 'felix-connector' ),
 			'show_cron_fallback' => true,
 		);
+	}
+
+	/**
+	 * Determine connection status for the UI.
+	 *
+	 * @return array {status: string, color: string, label: string, show_cron_fallback: bool}
+	 */
+	private function get_connection_status() {
+		$paired           = (bool) get_option( FELIX_OPT_PAIRED, false );
+		$heartbeat        = (int) get_option( FELIX_OPT_RUNNER_HEARTBEAT, 0 );
+		$wp_cron_disabled = defined( 'DISABLE_WP_CRON' ) && DISABLE_WP_CRON;
+
+		return self::connection_status_from_state( $paired, $heartbeat, $wp_cron_disabled, time() );
 	}
 
 	public function render_page() {

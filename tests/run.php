@@ -1768,6 +1768,81 @@ function test_pair_error_copy() {
 	);
 }
 
+/**
+ * Connected is heartbeat-based. A skipped cron tick (fresh last_run_at, no
+ * poll) must stay Connecting… until a real poll writes the heartbeat.
+ */
+function test_connection_status_uses_heartbeat_not_skipped_run() {
+	echo "\n[connection status honesty]\n";
+	$now = 1_700_000_000;
+
+	$unpaired = Felix_Settings::connection_status_from_state( false, $now, false, $now );
+	expect_eq( 'unpaired is not_paired', $unpaired['status'], 'not_paired' );
+
+	$skipped_lookalike = Felix_Settings::connection_status_from_state( true, 0, true, $now );
+	expect_eq( 'paired with no heartbeat stays connecting', $skipped_lookalike['status'], 'connecting' );
+	expect( 'no-heartbeat still shows cron fallback when DISABLE_WP_CRON', $skipped_lookalike['show_cron_fallback'] );
+
+	$fresh = Felix_Settings::connection_status_from_state( true, $now - 30, false, $now );
+	expect_eq( 'fresh heartbeat is connected', $fresh['status'], 'connected' );
+
+	$staleish = Felix_Settings::connection_status_from_state( true, $now - 901, false, $now );
+	expect_eq( 'heartbeat 15min+ is connecting', $staleish['status'], 'connecting' );
+
+	$dead = Felix_Settings::connection_status_from_state( true, $now - 7200, true, $now );
+	expect_eq( 'heartbeat 2h+ with DISABLE_WP_CRON is wp_cron_disabled', $dead['status'], 'wp_cron_disabled' );
+
+	$dead_cron_on = Felix_Settings::connection_status_from_state( true, $now - 7200, false, $now );
+	expect_eq( 'heartbeat 2h+ with cron enabled is stale', $dead_cron_on['status'], 'stale' );
+}
+
+/**
+ * Skipped runs record status but must not stamp last_run_at (old Connected lie).
+ */
+function test_skipped_run_does_not_stamp_last_run_at() {
+	echo "\n[skipped run does not stamp last_run_at]\n";
+	$GLOBALS['__felix_options'] = array();
+
+	Felix_Runner::persist_run_outcome( 'skipped' );
+	expect( 'skipped does not set last_run_at', ! isset( $GLOBALS['__felix_options']['felix_last_run_at'] ) );
+	expect_eq( 'skipped still records status', $GLOBALS['__felix_options']['felix_last_run_status'], 'skipped' );
+
+	Felix_Runner::persist_run_outcome( 'success' );
+	$stamped = $GLOBALS['__felix_options']['felix_last_run_at'];
+	expect( 'success stamps last_run_at', is_int( $stamped ) && $stamped > 0 );
+	expect_eq( 'success sets liveness connected', $GLOBALS['__felix_options'][ FELIX_OPT_LIVENESS_STATE ], 'connected' );
+
+	$before_skip = $stamped;
+	// Freeze: skipped must leave the success timestamp alone.
+	Felix_Runner::persist_run_outcome( 'skipped' );
+	expect_eq( 'skipped leaves last_run_at from last real run', $GLOBALS['__felix_options']['felix_last_run_at'], $before_skip );
+	expect_eq( 'skipped overwrites status only', $GLOBALS['__felix_options']['felix_last_run_status'], 'skipped' );
+}
+
+/**
+ * Unpair must drop the runner lease so a re-pair within ~60s can check in.
+ */
+function test_unpair_clears_runner_lease() {
+	echo "\n[unpair clears runner lease]\n";
+	$keys = Felix_Settings::pairing_state_option_keys();
+	expect( 'unpair list includes runner lease', in_array( FELIX_OPT_RUNNER_LEASE, $keys, true ) );
+	expect( 'unpair list includes heartbeat', in_array( FELIX_OPT_RUNNER_HEARTBEAT, $keys, true ) );
+	expect( 'unpair list includes paired flag', in_array( FELIX_OPT_PAIRED, $keys, true ) );
+
+	$GLOBALS['__felix_options'] = array(
+		FELIX_OPT_PAIRED         => true,
+		FELIX_OPT_RUNNER_LEASE   => array( 'holder' => 'old-runner', 'expiresAt' => time() + 60 ),
+		FELIX_OPT_RUNNER_HEARTBEAT => time(),
+		'felix_last_run_at'      => time(),
+	);
+	foreach ( $keys as $key ) {
+		delete_option( $key );
+	}
+	expect( 'lease gone after unpair keys deleted', ! isset( $GLOBALS['__felix_options'][ FELIX_OPT_RUNNER_LEASE ] ) );
+	expect( 'paired flag gone', ! isset( $GLOBALS['__felix_options'][ FELIX_OPT_PAIRED ] ) );
+	expect( 'heartbeat gone', ! isset( $GLOBALS['__felix_options'][ FELIX_OPT_RUNNER_HEARTBEAT ] ) );
+}
+
 // =============================================================================
 // RUN
 // =============================================================================
@@ -1797,6 +1872,9 @@ test_pairing_code_normalization();
 test_required_release_files_present();
 test_cron_fallback_and_connecting_copy();
 test_pair_error_copy();
+test_connection_status_uses_heartbeat_not_skipped_run();
+test_skipped_run_does_not_stamp_last_run_at();
+test_unpair_clears_runner_lease();
 
 // v0.4.1 command-surface parity.
 test_command_surface_parity();

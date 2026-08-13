@@ -298,20 +298,35 @@ class Felix_Runner {
 	}
 
 	/**
-	 * Record run outcome for UI freshness tracking.
+	 * Persist run outcome for diagnostics and liveness.
+	 *
+	 * Skipped runs must not bump last_run_at — that would make a no-op look
+	 * like a successful check-in. Connected in the UI is keyed off heartbeat,
+	 * which is only written inside the poll loop after the lease is held.
 	 *
 	 * @param string $status success|error|skipped
 	 */
-	private function record_run( $status ) {
-		update_option( 'felix_last_run_at', time() );
+	public static function persist_run_outcome( $status ) {
+		$status = (string) $status;
+		if ( 'skipped' !== $status ) {
+			update_option( 'felix_last_run_at', time() );
+		}
 		update_option( 'felix_last_run_status', $status );
 
-		// Update local liveness state so the settings page reflects reality.
 		if ( 'success' === $status ) {
 			update_option( FELIX_OPT_LIVENESS_STATE, 'connected' );
 		} elseif ( 'error' === $status && get_option( FELIX_OPT_LIVENESS_STATE ) === 'connected' ) {
 			update_option( FELIX_OPT_LIVENESS_STATE, 'reconnecting' );
 		}
+	}
+
+	/**
+	 * Record run outcome for UI freshness tracking.
+	 *
+	 * @param string $status success|error|skipped
+	 */
+	private function record_run( $status ) {
+		self::persist_run_outcome( $status );
 	}
 
 	/**

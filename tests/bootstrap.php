@@ -20,7 +20,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 // --- Plugin constants (mirror felix-connector.php) ---------------------------
-define( 'FELIX_CONNECTOR_VERSION', '0.4.2' );
+define( 'FELIX_CONNECTOR_VERSION', '0.4.3' );
 define( 'FELIX_CONNECTOR_PLUGIN_FILE', __FILE__ );
 define( 'FELIX_CONNECTOR_PLUGIN_DIR', __DIR__ . '/../' );
 define( 'FELIX_CONNECTOR_PLUGIN_URL', '' );
@@ -1132,3 +1132,4 @@ require_once FELIX_CONNECTOR_PLUGIN_DIR . 'includes/class-felix-command-ledger.p
 require_once FELIX_CONNECTOR_PLUGIN_DIR . 'includes/class-felix-command-handlers.php';
 require_once FELIX_CONNECTOR_PLUGIN_DIR . 'includes/class-felix-command-processor.php';
 require_once FELIX_CONNECTOR_PLUGIN_DIR . 'includes/class-felix-rest.php';
+require_once FELIX_CONNECTOR_PLUGIN_DIR . 'includes/class-felix-runner.php';

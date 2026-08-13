@@ -4,7 +4,7 @@ Tags: woocommerce, customer service, ai, automation, ecommerce
 Requires at least: 6.0
 Tested up to: 6.5
 Requires PHP: 8.1
-Stable tag: 0.4.2
+Stable tag: 0.4.3
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -101,6 +101,10 @@ Copy the exact command from WooCommerce → Felix Connector → Advanced & Troub
 Optional: if `runner.php` is present in the plugin directory, you can instead run it via PHP CLI. A scheduled task and the WordPress built-in scheduler can coexist safely — they share a lock so commands are never double-executed.
 
 == Changelog ==
+
+= 0.4.3 =
+* Fix: Connected status is keyed off poll-loop heartbeat, not skipped `last_run_at` (a skipped cron tick no longer looks Connected)
+* Fix: disconnecting clears the runner lease so a re-pair within ~60s can check in immediately
 
 = 0.4.2 =
 * Fix: ship `runner.php` in the release ZIP (it was missing from v0.4.0, so advertised cron paths 404'd)

@@ -3,7 +3,7 @@
  * Plugin Name:       Felix Connector
  * Plugin URI:        https://agentfelix.ai
  * Description:       Connects your WooCommerce store to Felix (agentfelix.ai). Felix executes commands locally via outbound-only communication — your store's host firewall is never bypassed.
- * Version:           0.4.2
+ * Version:           0.4.3
  * Requires at least: 6.0
  * Requires PHP:      8.1
  * Author:            Felix
@@ -23,7 +23,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 // These MUST load before the CLI short-circuit below: Felix_Runner now depends
 // on the shared processor/handlers/ledger/crypto/pairing classes and on the
 // option/protocol constants at runtime.
-define( 'FELIX_CONNECTOR_VERSION', '0.4.2' );
+define( 'FELIX_CONNECTOR_VERSION', '0.4.3' );
 define( 'FELIX_CONNECTOR_PLUGIN_FILE', __FILE__ );
 define( 'FELIX_CONNECTOR_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'FELIX_CONNECTOR_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
