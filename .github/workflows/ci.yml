@@ -5,6 +5,8 @@ on:
     branches: [main]
   pull_request:
 
+# PRs still run tests. The release job is main-only and needs write
+# to create a GitHub Release + tag (merging to main does not do that).
 jobs:
   test-and-zip:
     runs-on: ubuntu-latest
@@ -31,3 +33,26 @@ jobs:
         with:
           name: felix-connector
           path: dist/felix-connector.zip
+
+  release:
+    name: Publish GitHub Release
+    needs: test-and-zip
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: plugin-github-release
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: felix-connector
+          path: dist
+
+      - name: Create GitHub Release for new plugin version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/publish-github-release.sh
