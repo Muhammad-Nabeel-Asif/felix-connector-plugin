@@ -8,7 +8,7 @@
  *
  * Command families:
  *   - system: ping
- *   - order_read: get_order, search_orders
+ *   - order_read: get_order, search_orders, list_orders
  *   - product_read: get_product, list_products
  *   - subscription_read: get_subscription, get_subscriptions, list_subscriptions, list_subscriptions_for_customer
  *   - coupon_read: get_coupon, list_coupons
@@ -48,6 +48,7 @@ class Felix_Command_Handlers {
 		'ping'                        => 'system',
 		'get_order'                   => 'order_read',
 		'search_orders'               => 'order_read',
+		'list_orders'                 => 'order_read',
 		'get_product'                 => 'product_read',
 		'list_products'               => 'product_read',
 		'get_subscription'            => 'subscription_read',
@@ -102,6 +103,7 @@ class Felix_Command_Handlers {
 			// Order reads
 			'get_order'     => array( $this, 'handle_get_order' ),
 			'search_orders' => array( $this, 'handle_search_orders' ),
+			'list_orders'   => array( $this, 'handle_list_orders' ),
 
 			// Sync (paged backfill for the data mirror)
 			'sync_orders'   => array( $this, 'handle_sync_orders' ),
@@ -216,6 +218,17 @@ class Felix_Command_Handlers {
 				'result'           => $result['result'] ?? null,
 				'processorTxnIds'  => $result['processorTxnIds'] ?? array(),
 			);
+		} catch ( Felix_Validation_Exception $e ) {
+			// Pre-mutation refusal. Nest must record this as deterministic
+			// `failed` (code validation_error), NEVER `unconfirmed` — no
+			// WooCommerce write has started, so a retry is safe.
+			return array(
+				'status' => 'failed',
+				'error'  => array(
+					'code'    => 'validation_error',
+					'message' => $e->getMessage(),
+				),
+			);
 		} catch ( Felix_Plugin_Not_Active_Exception $e ) {
 			return array(
 				'status' => 'failed',
@@ -224,11 +237,15 @@ class Felix_Command_Handlers {
 					'message' => $e->getMessage(),
 				),
 			);
-		} catch ( Exception $e ) {
+		} catch ( Throwable $e ) {
+			// Catch Error/TypeError as well as Exception. An engine throwable
+			// mid-handler must become a readable terminal, not kill the request
+			// while a ledger row is still reserved (ambiguous forever).
+			$code = $e instanceof Error ? 'execution_fatal' : 'execution_error';
 			return array(
 				'status' => 'failed',
 				'error'  => array(
-					'code'    => 'execution_error',
+					'code'    => $code,
 					'message' => $e->getMessage(),
 				),
 			);
@@ -360,6 +377,87 @@ class Felix_Command_Handlers {
 		if ( ! function_exists( 'wcs_get_subscription' ) ) {
 			throw new Felix_Plugin_Not_Active_Exception( 'WooCommerce Subscriptions plugin is not active' );
 		}
+	}
+
+	/**
+	 * Reject non-finite or >2-decimal money before any WooCommerce mutation.
+	 * Matches backend formatMoneyArg: 18.9 is exact cents, 18.901 is refused
+	 * (never silently rounded).
+	 *
+	 * @param mixed $raw
+	 * @throws Felix_Validation_Exception
+	 */
+	private function reject_invalid_money_amount( $raw ) {
+		if ( is_string( $raw ) ) {
+			$trim = trim( $raw );
+			if ( '' === $trim || (bool) preg_match( '/nan|inf/i', $trim ) ) {
+				throw new Felix_Validation_Exception( sprintf( 'Invalid money amount: %s', $raw ) );
+			}
+			$raw = $trim;
+		}
+		if ( ! is_numeric( $raw ) ) {
+			throw new Felix_Validation_Exception( sprintf( 'Invalid money amount: %s', is_scalar( $raw ) ? $raw : gettype( $raw ) ) );
+		}
+		$n = (float) $raw;
+		if ( is_nan( $n ) || is_infinite( $n ) ) {
+			throw new Felix_Validation_Exception( 'Money amount must be finite' );
+		}
+		$cents = (int) round( $n * 100 );
+		if ( abs( ( $n * 100 ) - $cents ) > 1e-6 ) {
+			throw new Felix_Validation_Exception(
+				sprintf( 'Money amount %s has more than 2 decimal places', is_scalar( $raw ) ? $raw : '' )
+			);
+		}
+	}
+
+	/**
+	 * Canonical 2-decimal money string for coupon writes (18.9 → "18.90").
+	 * Rejects negatives, non-finite values, and >2 decimal places.
+	 *
+	 * @param mixed $raw
+	 * @return string
+	 * @throws Felix_Validation_Exception
+	 */
+	private function canonicalize_money_amount( $raw ) {
+		$this->reject_invalid_money_amount( $raw );
+		$n = (float) $raw;
+		if ( $n < 0 ) {
+			throw new Felix_Validation_Exception( sprintf( 'Money amount %s must be greater than or equal to zero', $raw ) );
+		}
+		$cents = (int) round( $n * 100 );
+		return number_format( $cents / 100, 2, '.', '' );
+	}
+
+	/**
+	 * Line-item quantity: missing defaults to 1; 0 / negative / non-integer /
+	 * non-numeric are rejected BEFORE wc_create_order.
+	 *
+	 * @param array $li
+	 * @return int
+	 * @throws Felix_Validation_Exception
+	 */
+	private function require_line_item_quantity( $li ) {
+		if ( ! array_key_exists( 'quantity', $li ) ) {
+			return 1;
+		}
+		$raw = $li['quantity'];
+		if ( is_bool( $raw ) || ( is_string( $raw ) && '' === trim( $raw ) ) || ! is_numeric( $raw ) ) {
+			throw new Felix_Validation_Exception(
+				sprintf( 'Invalid line item quantity: %s', is_scalar( $raw ) ? $raw : gettype( $raw ) )
+			);
+		}
+		$n = (float) $raw;
+		if ( is_nan( $n ) || is_infinite( $n ) ) {
+			throw new Felix_Validation_Exception( 'Line item quantity must be finite' );
+		}
+		if ( abs( $n - round( $n ) ) > 1e-9 ) {
+			throw new Felix_Validation_Exception( sprintf( 'Line item quantity must be a whole number (got %s)', $raw ) );
+		}
+		$qty = (int) round( $n );
+		if ( $qty < 1 ) {
+			throw new Felix_Validation_Exception( sprintf( 'Line item quantity must be at least 1 (got %s)', $raw ) );
+		}
+		return $qty;
 	}
 
 	/**
@@ -561,23 +659,110 @@ class Felix_Command_Handlers {
 	}
 
 	/**
+	 * Handler: list_orders — live date-range / status listing.
+	 *
+	 * Date bounds are converted to unix timestamps before they reach
+	 * wc_get_orders. HPOS OrdersTableQuery does not reliably parse offset-ISO
+	 * (`2026-08-13T00:00:00-05:00`); unix `date_created` ranges are the
+	 * documented contract.
+	 */
+	private function handle_list_orders( $args, $command_id ) {
+		$this->require_woocommerce();
+
+		$limit = min( max( intval( $args['limit'] ?? 50 ), 1 ), 100 );
+		$page  = max( intval( $args['page'] ?? 1 ), 1 );
+
+		$query = array(
+			'limit'   => $limit,
+			'page'    => $page,
+			'orderby' => 'date',
+			'order'   => 'DESC',
+			'type'    => 'shop_order',
+			'return'  => 'objects',
+		);
+
+		if ( ! empty( $args['status'] ) ) {
+			$query['status'] = $args['status'];
+		}
+
+		$after  = $this->to_wc_unix_bound( $args['after'] ?? null );
+		$before = $this->to_wc_unix_bound( $args['before'] ?? null );
+		if ( null !== $after && null !== $before ) {
+			$query['date_created'] = $after . '...' . $before;
+		} elseif ( null !== $after ) {
+			$query['date_created'] = '>=' . $after;
+		} elseif ( null !== $before ) {
+			$query['date_created'] = '<=' . $before;
+		}
+
+		$orders = wc_get_orders( $query );
+
+		$serialized = array();
+		foreach ( $orders as $order ) {
+			$serialized[] = $this->serialize_order( $order );
+		}
+
+		return array(
+			'result' => array(
+				'orders'       => $serialized,
+				'count'        => count( $serialized ),
+				'page'         => $page,
+				'possiblyMore' => count( $serialized ) === $limit,
+			),
+		);
+	}
+
+	/**
+	 * Convert an ISO-8601 / numeric date bound to a unix timestamp string for
+	 * wc_get_orders `date_created`. Returns null for empty input.
+	 *
+	 * @param mixed $raw
+	 * @return string|null
+	 */
+	private function to_wc_unix_bound( $raw ) {
+		if ( null === $raw || '' === $raw ) {
+			return null;
+		}
+		if ( is_numeric( $raw ) ) {
+			return (string) intval( $raw );
+		}
+		$ts = strtotime( (string) $raw );
+		if ( false === $ts ) {
+			throw new Exception( sprintf( 'Invalid date bound: %s', $raw ) );
+		}
+		return (string) $ts;
+	}
+
+	/**
 	 * Search orders by customer email.
+	 *
+	 * Real WooCommerce (HPOS OrdersTableQuery) honors `billing_email` / `customer`
+	 * and ignores a `search` query var. Passing `search` returns the newest N
+	 * orders of ANY customer; a PHP post-filter then drops non-matches, which
+	 * silently returns [] when the target customer's orders are not in that
+	 * unfiltered page.
 	 */
 	private function search_orders_by_email( $email, $limit = 20 ) {
+		$email_lower = strtolower( trim( (string) $email ) );
+		$limit       = min( max( intval( $limit ), 1 ), 100 );
+
 		$orders = wc_get_orders(
 			array(
-				'limit'    => $limit,
-				'orderby'  => 'date',
-				'order'    => 'DESC',
-				'search'   => $email,
+				'limit'         => $limit,
+				'orderby'       => 'date',
+				'order'         => 'DESC',
+				'type'          => 'shop_order',
+				'return'        => 'objects',
+				'billing_email' => $email_lower,
 			)
 		);
 
-		// WC 'search' is fuzzy (matches name/email/etc), so filter to EXACT billing-email matches.
-		$email_lower = strtolower( $email );
-		$orders = array_filter( $orders, function ( $order ) use ( $email_lower ) {
-			return strtolower( $order->get_billing_email() ) === $email_lower;
-		} );
+		$orders = array_filter(
+			$orders,
+			function ( $order ) use ( $email_lower ) {
+				return strtolower( $order->get_billing_email() ) === $email_lower;
+			}
+		);
 
 		$serialized = array();
 		foreach ( $orders as $order ) {
@@ -881,34 +1066,115 @@ class Felix_Command_Handlers {
 	private function handle_list_customers( $args, $command_id ) {
 		$this->require_woocommerce();
 
-		$query_args = array(
-			'limit'   => $args['limit'] ?? 50,
-			'orderby' => 'date',
-			'order'   => 'DESC',
-		);
+		$limit = min( max( intval( $args['limit'] ?? 50 ), 1 ), 100 );
+		$page  = max( intval( $args['page'] ?? 1 ), 1 );
 
-		if ( isset( $args['email'] ) ) {
-			$query_args['email'] = $args['email'];
+		$query_args = array(
+			'limit'   => $limit,
+			'paged'   => $page,
+			'orderby' => 'registered',
+			'order'   => 'DESC',
+			'role'    => 'customer',
+		);
+		if ( ! empty( $args['email'] ) ) {
+			$query_args['email'] = strtolower( trim( (string) $args['email'] ) );
 		}
 
-		$customers = wc_get_customers( $query_args );
+		// wc_get_customers is not a WooCommerce function (live WC 11 fatals).
+		// WC_Customer_Query is the supported storefront query (same datastore
+		// the REST /customers endpoint uses). Fall back to get_users so a
+		// store without that class still returns a terminal, never a fatal.
+		$customers = array();
+		if ( class_exists( 'WC_Customer_Query' ) ) {
+			$wc_query_args = array(
+				'limit'   => $limit,
+				'page'    => $page,
+				'orderby' => 'registered',
+				'order'   => 'DESC',
+				'role'    => 'customer',
+			);
+			if ( ! empty( $query_args['email'] ) ) {
+				$wc_query_args['email'] = $query_args['email'];
+			}
+			$query     = new WC_Customer_Query( $wc_query_args );
+			$customers = $query->get_customers();
+		} elseif ( function_exists( 'get_users' ) ) {
+			$wp_args = array(
+				'role'    => 'customer',
+				'number'  => $limit,
+				'paged'   => $page,
+				'orderby' => 'registered',
+				'order'   => 'DESC',
+			);
+			if ( ! empty( $query_args['email'] ) ) {
+				$wp_args['search']         = $query_args['email'];
+				$wp_args['search_columns'] = array( 'user_email' );
+			}
+			$customers = get_users( $wp_args );
+		}
 
 		$serialized = array();
-		foreach ( $customers as $customer ) {
-			$serialized[] = array(
-				'id'        => $customer['id'] ?? null,
-				'email'     => $customer['email'] ?? null,
-				'firstName' => $customer['first_name'] ?? null,
-				'lastName'  => $customer['last_name'] ?? null,
-				'username'  => $customer['username'] ?? null,
-				'orders'    => $customer['orders_count'] ?? 0,
-				'totalSpent'=> $customer['total_spent'] ?? '0',
-			);
+		foreach ( (array) $customers as $customer ) {
+			$row = $this->serialize_customer( $customer );
+			if ( null !== $row ) {
+				$serialized[] = $row;
+			}
 		}
 
 		return array(
-			'result' => array( 'customers' => $serialized ),
+			'result' => array(
+				'customers'    => $serialized,
+				'count'        => count( $serialized ),
+				'page'         => $page,
+				'possiblyMore' => count( $serialized ) === $limit,
+			),
 		);
+	}
+
+	/**
+	 * @param mixed $customer WC_Customer, WP_User, or array.
+	 * @return array|null
+	 */
+	private function serialize_customer( $customer ) {
+		if ( is_object( $customer ) && method_exists( $customer, 'get_id' ) && method_exists( $customer, 'get_email' ) ) {
+			$first = method_exists( $customer, 'get_first_name' ) ? $customer->get_first_name() : '';
+			$last  = method_exists( $customer, 'get_last_name' ) ? $customer->get_last_name() : '';
+			$user  = method_exists( $customer, 'get_username' ) ? $customer->get_username() : '';
+			$orders = method_exists( $customer, 'get_order_count' ) ? $customer->get_order_count() : 0;
+			$spent  = method_exists( $customer, 'get_total_spent' ) ? $customer->get_total_spent() : '0';
+			return array(
+				'id'         => $customer->get_id(),
+				'email'      => $customer->get_email(),
+				'firstName'  => $first,
+				'lastName'   => $last,
+				'username'   => $user,
+				'orders'     => $orders,
+				'totalSpent' => $spent,
+			);
+		}
+		if ( is_object( $customer ) && isset( $customer->ID ) ) {
+			return array(
+				'id'         => (int) $customer->ID,
+				'email'      => $customer->user_email ?? '',
+				'firstName'  => $customer->first_name ?? '',
+				'lastName'   => $customer->last_name ?? '',
+				'username'   => $customer->user_login ?? '',
+				'orders'     => 0,
+				'totalSpent' => '0',
+			);
+		}
+		if ( is_array( $customer ) ) {
+			return array(
+				'id'         => $customer['id'] ?? null,
+				'email'      => $customer['email'] ?? null,
+				'firstName'  => $customer['first_name'] ?? null,
+				'lastName'   => $customer['last_name'] ?? null,
+				'username'   => $customer['username'] ?? null,
+				'orders'     => $customer['orders_count'] ?? 0,
+				'totalSpent' => $customer['total_spent'] ?? '0',
+			);
+		}
+		return null;
 	}
 
 	// -------------------------------------------------------------------------
@@ -1112,19 +1378,19 @@ class Felix_Command_Handlers {
 
 		$code = $args['code'] ?? null;
 		if ( ! $code ) {
-			throw new Exception( 'create_coupon requires code' );
+			throw new Felix_Validation_Exception( 'create_coupon requires code' );
 		}
 
 		// Check if coupon already exists.
 		$existing = new WC_Coupon( wc_sanitize_coupon_code( $code ) );
 		if ( $existing->get_id() > 0 ) {
-			throw new Exception( sprintf( 'Coupon code "%s" already exists', $code ) );
+			throw new Felix_Validation_Exception( sprintf( 'Coupon code "%s" already exists', $code ) );
 		}
 
 		$coupon = new WC_Coupon();
 		$coupon->set_code( wc_sanitize_coupon_code( $code ) );
 		$coupon->set_discount_type( $args['type'] ?? 'percent' );
-		$coupon->set_amount( $args['amount'] ?? 0 );
+		$coupon->set_amount( $this->canonicalize_money_amount( $args['amount'] ?? 0 ) );
 
 		if ( isset( $args['description'] ) ) {
 			$coupon->set_description( $args['description'] );
@@ -1165,16 +1431,16 @@ class Felix_Command_Handlers {
 
 		$code = $args['code'] ?? null;
 		if ( ! $code ) {
-			throw new Exception( 'update_coupon requires code' );
+			throw new Felix_Validation_Exception( 'update_coupon requires code' );
 		}
 
 		$coupon = new WC_Coupon( wc_sanitize_coupon_code( $code ) );
 		if ( ! $coupon->get_id() ) {
-			throw new Exception( sprintf( 'Coupon "%s" not found', $code ) );
+			throw new Felix_Validation_Exception( sprintf( 'Coupon "%s" not found', $code ) );
 		}
 
 		if ( isset( $args['amount'] ) ) {
-			$coupon->set_amount( $args['amount'] );
+			$coupon->set_amount( $this->canonicalize_money_amount( $args['amount'] ) );
 		}
 		if ( isset( $args['type'] ) ) {
 			$coupon->set_discount_type( $args['type'] );
@@ -1210,12 +1476,12 @@ class Felix_Command_Handlers {
 
 		$code = $args['code'] ?? null;
 		if ( ! $code ) {
-			throw new Exception( 'deactivate_coupon requires code' );
+			throw new Felix_Validation_Exception( 'deactivate_coupon requires code' );
 		}
 
 		$coupon = new WC_Coupon( wc_sanitize_coupon_code( $code ) );
 		if ( ! $coupon->get_id() ) {
-			throw new Exception( sprintf( 'Coupon "%s" not found', $code ) );
+			throw new Felix_Validation_Exception( sprintf( 'Coupon "%s" not found', $code ) );
 		}
 
 		// Deactivate by setting expiry in the past.
@@ -1492,12 +1758,14 @@ class Felix_Command_Handlers {
 		$amount   = $args['amount'] ?? null;
 
 		if ( ! $order_id || null === $amount ) {
-			throw new Exception( 'refund.create requires orderId and amount' );
+			throw new Felix_Validation_Exception( 'refund.create requires orderId and amount' );
 		}
+
+		$this->reject_invalid_money_amount( $amount );
 
 		$order = wc_get_order( $order_id );
 		if ( ! $order ) {
-			throw new Exception( sprintf( 'Order %s not found', $order_id ) );
+			throw new Felix_Validation_Exception( sprintf( 'Order %s not found', $order_id ) );
 		}
 
 		$total     = (float) $order->get_total();
@@ -1508,11 +1776,11 @@ class Felix_Command_Handlers {
 		// a negative amount never satisfies `> $remaining`, so it would slip
 		// past the upper-bound check and reach wc_create_refund unchecked.
 		if ( (float) $amount <= 0 ) {
-			throw new Exception( sprintf( 'Refund amount %s must be greater than zero', $amount ) );
+			throw new Felix_Validation_Exception( sprintf( 'Refund amount %s must be greater than zero', $amount ) );
 		}
 
 		if ( (float) $amount > $remaining ) {
-			throw new Exception( sprintf( 'Refund amount %s exceeds remaining refundable total %s', $amount, $remaining ) );
+			throw new Felix_Validation_Exception( sprintf( 'Refund amount %s exceeds remaining refundable total %s', $amount, $remaining ) );
 		}
 
 		$refund = wc_create_refund(
@@ -1578,14 +1846,23 @@ class Felix_Command_Handlers {
 
 		$line_items = $args['lineItems'] ?? null;
 		if ( ! is_array( $line_items ) || empty( $line_items ) ) {
-			throw new Exception( 'create_order requires lineItems' );
+			throw new Felix_Validation_Exception( 'create_order requires lineItems' );
 		}
 
-		// Arg-validation: a negative priceOverride would invert a line total,
-		// so reject any negative value up front — before any order is created.
+		// Validate every line BEFORE wc_create_order so invalid qty/product
+		// cannot leave a partial WooCommerce order.
 		foreach ( $line_items as $li ) {
 			if ( array_key_exists( 'priceOverride', $li ) && (float) $li['priceOverride'] < 0 ) {
-				throw new Exception( sprintf( 'priceOverride must be greater than or equal to zero (productId %s got %s)', $li['productId'] ?? '', $li['priceOverride'] ) );
+				throw new Felix_Validation_Exception( sprintf( 'priceOverride must be greater than or equal to zero (productId %s got %s)', $li['productId'] ?? '', $li['priceOverride'] ) );
+			}
+			$product_id = $li['productId'] ?? null;
+			if ( ! $product_id ) {
+				throw new Felix_Validation_Exception( 'each lineItem requires productId' );
+			}
+			$this->require_line_item_quantity( $li );
+			$product = wc_get_product( $product_id );
+			if ( ! $product ) {
+				throw new Felix_Validation_Exception( sprintf( 'Product %s not found', $product_id ) );
 			}
 		}
 
@@ -1607,16 +1884,9 @@ class Felix_Command_Handlers {
 
 		// Add products (records the catalog price per line).
 		foreach ( $line_items as $li ) {
-			$product_id = $li['productId'] ?? null;
-			if ( ! $product_id ) {
-				throw new Exception( 'each lineItem requires productId' );
-			}
-			$qty = isset( $li['quantity'] ) ? max( (int) $li['quantity'], 1 ) : 1;
-
-			$product = wc_get_product( $product_id );
-			if ( ! $product ) {
-				throw new Exception( sprintf( 'Product %s not found', $product_id ) );
-			}
+			$product_id = $li['productId'];
+			$qty        = $this->require_line_item_quantity( $li );
+			$product    = wc_get_product( $product_id );
 			$order->add_product( $product, $qty );
 		}
 
@@ -1752,7 +2022,7 @@ class Felix_Command_Handlers {
 		$email       = $args['email'] ?? null;
 
 		if ( ! $customer_id && ! $email ) {
-			throw new Exception( 'delete_customer requires customerId or email' );
+			throw new Felix_Validation_Exception( 'delete_customer requires customerId or email' );
 		}
 
 		$user = null;
@@ -1763,7 +2033,7 @@ class Felix_Command_Handlers {
 		}
 
 		if ( ! $user ) {
-			throw new Exception( 'Customer not found' );
+			throw new Felix_Validation_Exception( 'Customer not found' );
 		}
 
 		// Role enforcement: a deletable user must hold the customer role —
@@ -1775,7 +2045,7 @@ class Felix_Command_Handlers {
 		$roles = isset( $user->roles ) ? array_values( (array) $user->roles ) : array();
 		if ( array( 'customer' ) !== $roles ) {
 			$role_label = ! empty( $roles ) ? implode( ',', $roles ) : 'unknown';
-			throw new Exception( sprintf( 'Refusing to delete non-customer user (roles: %s)', $role_label ) );
+			throw new Felix_Validation_Exception( sprintf( 'Refusing to delete non-customer user (roles: %s)', $role_label ) );
 		}
 
 		if ( ! function_exists( 'wp_delete_user' ) ) {
@@ -1988,4 +2258,13 @@ class Felix_Command_Handlers {
  * Custom exception for when a required plugin (WC, WC Subscriptions) is not active.
  */
 class Felix_Plugin_Not_Active_Exception extends Exception {
+}
+
+/**
+ * Pre-mutation argument/state refusal. Distinct from a generic Exception so
+ * the shared execute() catch maps it to `validation_error` (confirmed
+ * failure, retry-safe) instead of `execution_error` (mutation may have
+ * applied → Nest reclassifies writes to unconfirmed).
+ */
+class Felix_Validation_Exception extends Exception {
 }

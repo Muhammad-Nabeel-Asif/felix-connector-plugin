@@ -429,8 +429,12 @@ function test_rest_endpoint() {
 	$rest   = new Felix_REST();
 	$resp   = $rest->handle_command( new Fake_REST_Request( '{}' ) );
 	expect_eq( 'unpaired => 404', $resp->get_status(), 404 );
+	$unpaired_body = json_encode( $resp->get_data() );
+	expect( 'unpaired 404 does not name not_paired', false === strpos( (string) $unpaired_body, 'not_paired' ) );
+	expect( 'unpaired 404 does not say Store is not paired', false === strpos( strtolower( (string) $unpaired_body ), 'not paired' ) );
 
-	// Paired, malformed body => 400.
+	// Paired + garbage is 400 — distinguishable by status from unpaired 404
+	// (informational oracle for a caller who already knows this WP origin).
 	reset_state();
 	make_backend_key();
 	$rest   = new Felix_REST();
@@ -1011,7 +1015,7 @@ function test_command_surface_parity() {
 	echo "\n[command-surface parity — family + handler for every type]\n";
 
 	$types = array(
-		'ping', 'get_order', 'search_orders', 'sync_orders', 'sync_products', 'sync_coupons',
+		'ping', 'get_order', 'search_orders', 'list_orders', 'sync_orders', 'sync_products', 'sync_coupons',
 		'get_product', 'list_products', 'list_customers',
 		'get_subscription', 'list_subscriptions', 'list_subscriptions_for_customer',
 		'get_coupon', 'list_coupons',
@@ -1101,6 +1105,24 @@ function test_refund_create() {
 	$r7 = exec_write( 'refund.create', array( 'orderId' => $oid2, 'amount' => -25 ) );
 	expect_eq( 'negative amount => failed', $r7['status'], 'failed' );
 	expect( 'negative amount message names zero', false !== strpos( $r7['error']['message'], 'zero' ) );
+
+	// (float) is comparison-only: wc_create_refund receives the original string.
+	$oid3 = seed_order( array( 'total' => 100.0 ) );
+	$r8 = exec_write( 'refund.create', array( 'orderId' => $oid3, 'amount' => '18.90', 'reason' => 'string amount' ) );
+	expect_eq( 'string amount refund => done', $r8['status'], 'done' );
+	expect_eq(
+		'wc_create_refund received the original string, not a float-cast copy',
+		$GLOBALS['__felix_last_refund_args']['amount'],
+		'18.90'
+	);
+
+	$oid4 = seed_order( array( 'total' => 100.0 ) );
+	$before_refunds = count( $GLOBALS['__felix_refunds'] );
+	$r9 = exec_write( 'refund.create', array( 'orderId' => $oid4, 'amount' => '18.901' ) );
+	expect_eq( '3-decimal refund => failed', $r9['status'], 'failed' );
+	expect_eq( '3-decimal refund is validation_error', $r9['error']['code'] ?? '', 'validation_error' );
+	expect( '3-decimal refund names decimal places', false !== strpos( $r9['error']['message'], 'decimal' ) );
+	expect_eq( '3-decimal refund created no WooCommerce refund', count( $GLOBALS['__felix_refunds'] ), $before_refunds );
 }
 
 /**
@@ -1477,6 +1499,36 @@ function test_create_order() {
 	expect_eq( 'negative priceOverride => failed', $r5['status'], 'failed' );
 	expect( 'negative override message names priceOverride', false !== strpos( $r5['error']['message'], 'priceOverride' ) );
 
+	$before = count( $GLOBALS['__felix_orders_meta'] );
+	$r_qty0 = exec_write( 'create_order', array( 'lineItems' => array( array( 'productId' => $p1, 'quantity' => 0 ) ) ) );
+	expect_eq( 'qty 0 => failed', $r_qty0['status'], 'failed' );
+	expect_eq( 'qty 0 is validation_error (not execution_error)', $r_qty0['error']['code'] ?? '', 'validation_error' );
+	expect( 'qty 0 message names at least 1', false !== strpos( $r_qty0['error']['message'], 'at least 1' ) );
+	expect_eq( 'qty 0 created no order', count( $GLOBALS['__felix_orders_meta'] ), $before );
+
+	$r_qty_neg = exec_write( 'create_order', array( 'lineItems' => array( array( 'productId' => $p1, 'quantity' => -2 ) ) ) );
+	expect_eq( 'qty -2 => failed', $r_qty_neg['status'], 'failed' );
+	expect_eq( 'qty -2 is validation_error', $r_qty_neg['error']['code'] ?? '', 'validation_error' );
+	expect_eq( 'qty -2 created no order', count( $GLOBALS['__felix_orders_meta'] ), $before );
+
+	$r_qty_neg1 = exec_write( 'create_order', array( 'lineItems' => array( array( 'productId' => $p1, 'quantity' => -1 ) ) ) );
+	expect_eq( 'qty -1 => failed', $r_qty_neg1['status'], 'failed' );
+
+	$r_qty_bad = exec_write( 'create_order', array( 'lineItems' => array( array( 'productId' => $p1, 'quantity' => 'nope' ) ) ) );
+	expect_eq( 'malformed qty => failed', $r_qty_bad['status'], 'failed' );
+	expect_eq( 'malformed qty is validation_error', $r_qty_bad['error']['code'] ?? '', 'validation_error' );
+
+	$r_qty_dec = exec_write( 'create_order', array( 'lineItems' => array( array( 'productId' => $p1, 'quantity' => 1.5 ) ) ) );
+	expect_eq( 'decimal qty => failed', $r_qty_dec['status'], 'failed' );
+	expect_eq( 'invalid qty created no order', count( $GLOBALS['__felix_orders_meta'] ), $before );
+
+	$r_qty1 = exec_write( 'create_order', array( 'lineItems' => array( array( 'productId' => $p1, 'quantity' => 1 ) ) ) );
+	expect_eq( 'qty 1 => done', $r_qty1['status'], 'done' );
+	$r_qty2 = exec_write( 'create_order', array( 'lineItems' => array( array( 'productId' => $p1, 'quantity' => 2 ) ) ) );
+	expect_eq( 'qty 2 => done', $r_qty2['status'], 'done' );
+	$r_missing_qty = exec_write( 'create_order', array( 'lineItems' => array( array( 'productId' => $p1 ) ) ) );
+	expect_eq( 'missing qty defaults to 1 => done', $r_missing_qty['status'], 'done' );
+
 	// P2-3: overrides correlate to order lines by productId, NOT by line
 	// position. Three products; override only the MIDDLE one and confirm that
 	// the middle line is re-priced while the outer lines keep their catalog
@@ -1661,6 +1713,311 @@ function test_new_family_authorization_classification() {
 	expect( 'sync allowed for connector-read', Felix_Command_Handlers::authorize( 'sync', read_basis() )['ok'] );
 }
 
+/**
+ * F-01 / F-02 — list_orders must exist; search_orders must query a WooCommerce
+ * arg that HPOS actually honors (billing_email / customer), not the ignored
+ * `search` key. The stub in bootstrap.php matches OrdersTableQuery on WC trunk:
+ * it filters billing_email and ignores `search`.
+ */
+function test_list_orders_and_search_orders_against_hpos_contract() {
+	echo "\n[list_orders + search_orders vs HPOS-faithful wc_get_orders]\n";
+	reset_state();
+
+	$h    = new Felix_Command_Handlers();
+	$prop = new ReflectionProperty( 'Felix_Command_Handlers', 'handlers' );
+	$prop->setAccessible( true );
+	$registered = $prop->getValue( $h );
+	expect( 'list_orders handler is registered', isset( $registered['list_orders'] ) );
+	expect_eq( 'list_orders family is order_read', Felix_Command_Handlers::family_for( 'list_orders' ), 'order_read' );
+
+	$r = exec_read( 'list_orders', array( 'limit' => 10 ) );
+	expect_eq( 'list_orders is not unknown_type', isset( $r['error']['code'] ) ? $r['error']['code'] : '', '' );
+	expect_eq( 'list_orders => done', $r['status'], 'done' );
+	expect_eq( 'empty store list_orders count is 0', $r['result']['count'] ?? -1, 0 );
+	expect( 'empty store list_orders orders is []', isset( $r['result']['orders'] ) && is_array( $r['result']['orders'] ) && 0 === count( $r['result']['orders'] ) );
+
+	$now = time();
+	$in_range = seed_order(
+		array(
+			'created' => $now - 60,
+			'billing' => array( 'email' => 'range@test.local' ),
+		)
+	);
+	seed_order(
+		array(
+			'created' => $now - 86400 * 10,
+			'billing' => array( 'email' => 'old@test.local' ),
+		)
+	);
+	$listed = exec_read(
+		'list_orders',
+		array(
+			'limit'  => 50,
+			'after'  => gmdate( 'c', $now - 3600 ),
+			'before' => gmdate( 'c', $now + 60 ),
+		)
+	);
+	expect_eq( 'date-range list_orders => done', $listed['status'], 'done' );
+	$listed_ids = array_map(
+		function ( $o ) {
+			return (int) $o['id'];
+		},
+		$listed['result']['orders'] ?? array()
+	);
+	expect( 'ISO after/before converted and applied — in-range order present', in_array( $in_range, $listed_ids, true ) );
+	expect_eq( 'date-range list_orders returns exactly the in-range order', count( $listed_ids ), 1 );
+
+	reset_state();
+	$now = time();
+	$old = seed_order(
+		array(
+			'created' => $now - 86400,
+			'billing' => array( 'email' => 'customer-a@test.local' ),
+		)
+	);
+	for ( $i = 0; $i < 25; $i++ ) {
+		seed_order(
+			array(
+				'created' => $now - $i,
+				'billing' => array( 'email' => 'customer-b@test.local' ),
+			)
+		);
+	}
+
+	$GLOBALS['__felix_last_wc_get_orders_args'] = null;
+	$search = exec_read( 'search_orders', array( 'email' => 'customer-a@test.local', 'limit' => 20 ) );
+	$passed = $GLOBALS['__felix_last_wc_get_orders_args'];
+	expect( 'search_orders called wc_get_orders', is_array( $passed ) );
+	expect( 'search_orders does not pass ignored `search` arg', ! isset( $passed['search'] ) );
+	expect( 'search_orders passes billing_email or customer', isset( $passed['billing_email'] ) || isset( $passed['customer'] ) );
+	expect_eq( 'search_orders => done', $search['status'], 'done' );
+	$ids = array_map(
+		function ( $o ) {
+			return (int) $o['id'];
+		},
+		$search['result']['orders'] ?? array()
+	);
+	expect( 'buried customer-a order is found among 25 newer other-customer orders', in_array( $old, $ids, true ) );
+
+	$case = exec_read( 'search_orders', array( 'email' => 'Customer-A@test.local', 'limit' => 20 ) );
+	$case_ids = array_map(
+		function ( $o ) {
+			return (int) $o['id'];
+		},
+		$case['result']['orders'] ?? array()
+	);
+	expect( 'case-insensitive billing email still finds the order', in_array( $old, $case_ids, true ) );
+}
+
+/**
+ * Coupon money precision — plugin must refuse >2 decimal amounts BEFORE
+ * WooCommerce mutation (live WC stored 18.901 when only the backend gated).
+ */
+function test_coupon_money_precision() {
+	echo "\n[coupon money precision — 18.901 refused before WooCommerce]\n";
+	reset_state();
+
+	$r = exec_write( 'create_coupon', array( 'code' => 'SAVE1890', 'type' => 'fixed_cart', 'amount' => '18.90' ) );
+	expect_eq( '18.90 succeeds', $r['status'], 'done' );
+	expect_eq( '18.90 stored canonical', $r['result']['amount'], '18.90' );
+
+	$r2 = exec_write( 'create_coupon', array( 'code' => 'SAVE189', 'type' => 'fixed_cart', 'amount' => '18.9' ) );
+	expect_eq( '18.9 succeeds', $r2['status'], 'done' );
+	expect_eq( '18.9 canonicalized to 18.90', $r2['result']['amount'], '18.90' );
+
+	$before = count( $GLOBALS['__felix_coupons'] );
+	$r3 = exec_write( 'create_coupon', array( 'code' => 'SAVE18901', 'type' => 'fixed_cart', 'amount' => '18.901' ) );
+	expect_eq( '18.901 fails', $r3['status'], 'failed' );
+	expect_eq( '18.901 is validation_error (not execution_error)', $r3['error']['code'] ?? '', 'validation_error' );
+	expect( '18.901 names decimal places', false !== strpos( $r3['error']['message'], 'decimal' ) );
+	expect_eq( '18.901 created no coupon', count( $GLOBALS['__felix_coupons'] ), $before );
+
+	$r4 = exec_write( 'create_coupon', array( 'code' => 'NEG', 'type' => 'fixed_cart', 'amount' => '-1' ) );
+	expect_eq( 'negative coupon fails', $r4['status'], 'failed' );
+	expect_eq( 'negative created no coupon', count( $GLOBALS['__felix_coupons'] ), $before );
+
+	$r5 = exec_write( 'create_coupon', array( 'code' => 'NAN', 'type' => 'fixed_cart', 'amount' => 'NaN' ) );
+	expect_eq( 'NaN coupon fails', $r5['status'], 'failed' );
+
+	$r6 = exec_write( 'create_coupon', array( 'code' => 'INF', 'type' => 'fixed_cart', 'amount' => 'Infinity' ) );
+	expect_eq( 'Infinity coupon fails', $r6['status'], 'failed' );
+
+	$r7 = exec_write( 'create_coupon', array( 'code' => 'PCT10', 'type' => 'percent', 'amount' => '10' ) );
+	expect_eq( 'percent 10 succeeds', $r7['status'], 'done' );
+	expect_eq( 'percent 10 canonical 10.00', $r7['result']['amount'], '10.00' );
+
+	$r8 = exec_write( 'create_coupon', array( 'code' => 'FPROD', 'type' => 'fixed_product', 'amount' => '2.00' ) );
+	expect_eq( 'fixed_product 2.00 succeeds', $r8['status'], 'done' );
+
+	$r9 = exec_write( 'update_coupon', array( 'code' => 'SAVE1890', 'amount' => '18.901' ) );
+	expect_eq( 'update 18.901 fails', $r9['status'], 'failed' );
+	expect_eq( 'update 18.901 is validation_error', $r9['error']['code'] ?? '', 'validation_error' );
+	$kept = new WC_Coupon( 'save1890' );
+	expect_eq( 'update 18.901 did not mutate stored amount', $kept->get_amount(), '18.90' );
+
+	// Processor retry of a rejected 18.901 command does not create a coupon.
+	$secret = make_backend_key();
+	list( $raw, $env ) = sign_envelope(
+		make_envelope(
+			array(
+				'type'               => 'create_coupon',
+				'args'               => array( 'code' => 'RETRY901', 'type' => 'fixed_cart', 'amount' => '18.901' ),
+				'authorizationBasis' => write_basis(),
+			)
+		),
+		$secret
+	);
+	$p   = new Felix_Command_Processor();
+	$t1  = $p->process( $raw, $env );
+	expect_eq( 'processor 18.901 failed', $t1['status'], 'failed' );
+	$t2 = $p->process( $raw, $env );
+	expect( 'processor retry alreadyExecuted or failed without extra coupon', ! empty( $t2['alreadyExecuted'] ) || 'failed' === $t2['status'] );
+	$retry_coupon = new WC_Coupon( 'retry901' );
+	expect( 'retry created no WooCommerce coupon', ! $retry_coupon->get_id() );
+}
+
+/**
+ * list_customers must use WC_Customer_Query, never the non-existent
+ * wc_get_customers() that fatals on real WooCommerce.
+ */
+function test_list_customers_uses_real_wc_api() {
+	echo "\n[list_customers — WC_Customer_Query, never wc_get_customers]\n";
+	reset_state();
+
+	$src = file_get_contents( FELIX_CONNECTOR_PLUGIN_DIR . 'includes/class-felix-command-handlers.php' );
+	expect( 'handler does not call wc_get_customers()', false === strpos( $src, 'wc_get_customers(' ) );
+	expect( 'handler uses WC_Customer_Query', false !== strpos( $src, 'WC_Customer_Query' ) );
+
+	$empty = exec_read( 'list_customers', array() );
+	expect_eq( 'empty result => done', $empty['status'], 'done' );
+	expect_eq( 'empty count 0', $empty['result']['count'] ?? -1, 0 );
+
+	$a = seed_user( array( 'user_email' => 'a@example.test', 'roles' => array( 'customer' ), 'first_name' => 'Ann' ) );
+	$b = seed_user( array( 'user_email' => 'b@example.test', 'roles' => array( 'customer' ) ) );
+	seed_user( array( 'user_email' => 'admin@example.test', 'roles' => array( 'administrator' ) ) );
+
+	$listed = exec_read( 'list_customers', array( 'limit' => 50 ) );
+	expect_eq( 'multiple => done', $listed['status'], 'done' );
+	expect_eq( 'customers only, not admin', $listed['result']['count'], 2 );
+
+	$one = exec_read( 'list_customers', array( 'email' => 'a@example.test' ) );
+	expect_eq( 'email filter => done', $one['status'], 'done' );
+	expect_eq( 'email filter count 1', $one['result']['count'], 1 );
+	expect_eq( 'email filter id', $one['result']['customers'][0]['id'], $a );
+
+	$page1 = exec_read( 'list_customers', array( 'limit' => 1, 'page' => 1 ) );
+	$page2 = exec_read( 'list_customers', array( 'limit' => 1, 'page' => 2 ) );
+	expect_eq( 'page 1 count 1', $page1['result']['count'], 1 );
+	expect_eq( 'page 1 possiblyMore', $page1['result']['possiblyMore'], true );
+	expect_eq( 'page 2 count 1', $page2['result']['count'], 1 );
+	expect( 'pages are different customers', $page1['result']['customers'][0]['id'] !== $page2['result']['customers'][0]['id'] );
+
+	$denied = ( new Felix_Command_Handlers() )->execute(
+		'cmd-lc-deny',
+		'list_customers',
+		array(),
+		null
+	);
+	expect( 'missing authorization denied', 'rejected' === $denied['status'] );
+}
+
+/**
+ * L-05 — pre-mutation refusals are `validation_error` (confirmed failed),
+ * never `execution_error` (which Nest reclassifies to unconfirmed).
+ * Unknown commands stay `rejected`/`unknown_type`. Mid-write Exceptions
+ * remain `execution_error` so genuinely ambiguous mutations stay locked.
+ */
+function test_l05_pre_mutation_validation_error() {
+	echo "\n[L-05 — pre-mutation validation_error vs execution_error]\n";
+	reset_state();
+
+	$unknown = ( new Felix_Command_Handlers() )->execute(
+		'cmd-unknown',
+		'not_a_real_command',
+		array(),
+		write_basis()
+	);
+	expect_eq( 'unknown command status is rejected', $unknown['status'], 'rejected' );
+	expect_eq( 'unknown command code is unknown_type', $unknown['error']['code'] ?? '', 'unknown_type' );
+	expect( 'unknown command is not unconfirmed', 'unconfirmed' !== $unknown['status'] );
+
+	$p1 = seed_product( array( 'price' => '10.00' ) );
+	$qty0 = exec_write( 'create_order', array( 'lineItems' => array( array( 'productId' => $p1, 'quantity' => 0 ) ) ) );
+	expect_eq( 'qty 0 stays failed', $qty0['status'], 'failed' );
+	expect_eq( 'qty 0 code validation_error', $qty0['error']['code'] ?? '', 'validation_error' );
+
+	$coupon = exec_write( 'create_coupon', array( 'code' => 'L05BAD', 'type' => 'fixed_cart', 'amount' => '18.901' ) );
+	expect_eq( '18.901 stays failed', $coupon['status'], 'failed' );
+	expect_eq( '18.901 code validation_error', $coupon['error']['code'] ?? '', 'validation_error' );
+
+	$h    = new Felix_Command_Handlers();
+	$prop = new ReflectionProperty( 'Felix_Command_Handlers', 'handlers' );
+	$prop->setAccessible( true );
+	$handlers = $prop->getValue( $h );
+	$handlers['test_throw_validation'] = function () {
+		throw new Felix_Validation_Exception( 'bad arg' );
+	};
+	$handlers['test_throw_midwrite'] = function () {
+		throw new Exception( 'wc save boom' );
+	};
+	$prop->setValue( $h, $handlers );
+
+	$v = $h->execute( 'cmd-val', 'test_throw_validation', array(), write_basis() );
+	expect_eq( 'ValidationException → failed', $v['status'], 'failed' );
+	expect_eq( 'ValidationException → validation_error', $v['error']['code'] ?? '', 'validation_error' );
+
+	$m = $h->execute( 'cmd-mid', 'test_throw_midwrite', array(), write_basis() );
+	expect_eq( 'mid-write Exception → failed', $m['status'], 'failed' );
+	expect_eq( 'mid-write Exception → execution_error (ambiguous)', $m['error']['code'] ?? '', 'execution_error' );
+}
+
+/**
+ * F-08 — engine Error/TypeError inside a handler must become a readable
+ * terminal, not kill the request mid-reservation.
+ */
+function test_engine_error_becomes_terminal() {
+	echo "\n[engine Error/TypeError → terminal envelope]\n";
+	reset_state();
+	$h    = new Felix_Command_Handlers();
+	$prop = new ReflectionProperty( 'Felix_Command_Handlers', 'handlers' );
+	$prop->setAccessible( true );
+	$handlers                       = $prop->getValue( $h );
+	$handlers['test_throw_error']   = function () {
+		throw new Error( 'engine boom' );
+	};
+	$handlers['test_throw_typeerr'] = function () {
+		throw new TypeError( 'bad type' );
+	};
+	$handlers['test_throw_exception'] = function () {
+		throw new Exception( 'userland boom' );
+	};
+	$prop->setValue( $h, $handlers );
+
+	try {
+		$r = $h->execute( 'cmd-err', 'test_throw_error', array(), read_basis() );
+		expect_eq( 'Error is a failed terminal (not a PHP fatal)', $r['status'], 'failed' );
+		expect( 'Error code is execution_fatal or execution_error', in_array( $r['error']['code'] ?? '', array( 'execution_fatal', 'execution_error' ), true ) );
+	} catch ( Throwable $t ) {
+		expect( 'Error escaped execute() as a PHP engine throwable — handler catch is Exception-only', false );
+	}
+
+	try {
+		$r2 = $h->execute( 'cmd-type', 'test_throw_typeerr', array(), read_basis() );
+		expect_eq( 'TypeError is a failed terminal', $r2['status'], 'failed' );
+		expect( 'TypeError code is execution_fatal or execution_error', in_array( $r2['error']['code'] ?? '', array( 'execution_fatal', 'execution_error' ), true ) );
+	} catch ( Throwable $t ) {
+		expect( 'TypeError escaped execute() as a PHP engine throwable — handler catch is Exception-only', false );
+	}
+
+	try {
+		$r3 = $h->execute( 'cmd-ex', 'test_throw_exception', array(), read_basis() );
+		expect_eq( 'Exception is a failed terminal', $r3['status'], 'failed' );
+		expect( 'Exception code is execution_error', ( $r3['error']['code'] ?? '' ) === 'execution_error' );
+	} catch ( Throwable $t ) {
+		expect( 'Exception escaped execute() — handler catch is broken', false );
+	}
+}
+
 // The runner class is only loaded via felix-connector.php (not in the test
 // bootstrap), but capability_list is referenced statically. Load it safely.
 if ( ! class_exists( 'Felix_Runner' ) ) {
@@ -1688,6 +2045,20 @@ function test_pairing_code_normalization() {
 	// Already-canonical input is idempotent.
 	expect_eq( 'idempotent on canonical input', Felix_Settings::normalize_pairing_code( 'K7QM9HR2' ), 'K7QM9HR2' );
 
+	// L-08 — API base resolution (never POSTs; injectable args only).
+	expect_eq( 'explicit base wins', Felix_Settings::resolve_api_base( 'https://api.test.local/', 'production' ), 'https://api.test.local' );
+	expect_eq( 'development without base fails closed', Felix_Settings::resolve_api_base( '', 'development' ), '' );
+	expect_eq( 'test without base fails closed', Felix_Settings::resolve_api_base( null, 'test' ), '' );
+	expect_eq( 'staging without base fails closed', Felix_Settings::resolve_api_base( '', 'staging' ), '' );
+	expect_eq( 'missing variable fails closed', Felix_Settings::resolve_api_base( null, null ), '' );
+	expect_eq( 'explicit production env defaults to production API', Felix_Settings::resolve_api_base( null, 'production' ), 'https://api.agentfelix.ai' );
+	expect_eq( 'bootstrap FELIX_API_BASE is test.local not production', Felix_Settings::resolve_api_base(), 'https://api.test.local' );
+	$boot = file_get_contents( FELIX_CONNECTOR_PLUGIN_DIR . 'felix-connector.php' );
+	expect(
+		'plugin bootstrap does not silently define production FELIX_API_BASE',
+		false === strpos( $boot, "define( 'FELIX_API_BASE', 'https://api.agentfelix.ai' )" )
+	);
+
 	// Validity gate: a correctly typed code normalizes to exactly 8 chars.
 	expect( 'grouped 8-char code is valid', strlen( Felix_Settings::normalize_pairing_code( 'K7QM-9HR2' ) ) === FELIX_PAIRING_CODE_LENGTH );
 
@@ -1702,6 +2073,168 @@ function test_pairing_code_normalization() {
 	$sample = Felix_Settings::normalize_pairing_code( 'K7QM9HR2' );
 	expect( 'canonical alphabet excludes 0', false === strpos( $sample, '0' ) );
 	expect( 'canonical alphabet excludes 1', false === strpos( $sample, '1' ) );
+}
+
+/**
+ * Release ZIP contract: every file the settings UI / cron docs reference
+ * must exist on disk. A ZIP that omitted runner.php 404'd on staging and
+ * left stores stuck on Connecting… when DISABLE_WP_CRON was set.
+ */
+function test_required_release_files_present() {
+	echo "\n[required release files present on disk]\n";
+	$files = Felix_Settings::required_release_files();
+	expect( 'runner.php is in the required-files list', in_array( 'runner.php', $files, true ) );
+	foreach ( $files as $rel ) {
+		expect( "release file exists: {$rel}", is_readable( FELIX_CONNECTOR_PLUGIN_DIR . $rel ) );
+	}
+	expect( 'runner_file_present() is true in this checkout', Felix_Settings::runner_file_present() );
+	$runner_src = file_get_contents( FELIX_CONNECTOR_PLUGIN_DIR . 'runner.php' );
+	expect(
+		'runner.php crontab example does not contain */5 (that sequence closes the PHP docblock and fatals CLI)',
+		false === strpos( $runner_src, '*/5' )
+	);
+}
+
+/**
+ * Cron fallback + Connecting copy: never advertise a missing runner.php
+ * path, and never claim a page view already triggered check-in.
+ */
+function test_cron_fallback_and_connecting_copy() {
+	echo "\n[cron fallback + honest Connecting copy]\n";
+
+	$cmd = Felix_Settings::wp_cron_http_command( 'https://staging9.shop.example.com' );
+	expect( 'wp-cron command uses wget', 0 === strpos( $cmd, 'wget' ) );
+	expect( 'wp-cron command hits wp-cron.php', false !== strpos( $cmd, 'wp-cron.php?doing_wp_cron' ) );
+	expect( 'wp-cron command uses the store host', false !== strpos( $cmd, 'staging9.shop.example.com' ) );
+	expect( 'wp-cron command does not mention runner.php', false === strpos( $cmd, 'runner.php' ) );
+
+	$php = Felix_Settings::php_runner_command();
+	expect( 'php runner command includes runner.php when the file exists', false !== strpos( $php, 'runner.php' ) );
+
+	$disabled = Felix_Settings::connecting_notice( true );
+	expect( 'disabled-cron notice names DISABLE_WP_CRON', false !== strpos( $disabled, 'DISABLE_WP_CRON' ) );
+	expect( 'disabled-cron notice does not claim page view triggered', false === strpos( strtolower( $disabled ), 'page view has already' ) );
+	expect( 'disabled-cron notice points at Check in now', false !== strpos( $disabled, 'Check in now' ) );
+
+	$enabled = Felix_Settings::connecting_notice( false );
+	expect( 'enabled-cron notice does not claim already triggered', false === strpos( strtolower( $enabled ), 'already triggered' ) );
+	expect( 'enabled-cron notice offers Check in now', false !== strpos( $enabled, 'Check in now' ) );
+}
+
+/**
+ * Pairing error copy: already-used / expired / not-found are explicit.
+ */
+function test_pair_error_copy() {
+	echo "\n[pairing error copy]\n";
+	expect(
+		'already used is explicit',
+		false !== strpos( Felix_Settings::format_pair_error( 400, array( 'message' => 'Pairing code already used' ) ), 'already used' )
+	);
+	expect(
+		'expired is explicit',
+		false !== strpos( Felix_Settings::format_pair_error( 400, array( 'message' => 'Pairing code expired' ) ), 'expired' )
+	);
+	expect(
+		'not found is explicit',
+		false !== strpos( Felix_Settings::format_pair_error( 404, array( 'message' => 'Pairing code not found' ) ), 'not found' )
+	);
+	expect(
+		'HTTP 404 without body still names not found',
+		false !== strpos( Felix_Settings::format_pair_error( 404, array() ), 'not found' )
+	);
+}
+
+/**
+ * Connected is heartbeat-based. A skipped cron tick (fresh last_run_at, no
+ * poll) must stay Connecting… until a real poll writes the heartbeat.
+ */
+function test_connection_status_uses_heartbeat_not_skipped_run() {
+	echo "\n[connection status honesty]\n";
+	$now = 1_700_000_000;
+
+	$unpaired = Felix_Settings::connection_status_from_state( false, $now, false, $now );
+	expect_eq( 'unpaired is not_paired', $unpaired['status'], 'not_paired' );
+
+	$skipped_lookalike = Felix_Settings::connection_status_from_state( true, 0, true, $now );
+	expect_eq( 'paired with no heartbeat stays connecting', $skipped_lookalike['status'], 'connecting' );
+	expect( 'no-heartbeat still shows cron fallback when DISABLE_WP_CRON', $skipped_lookalike['show_cron_fallback'] );
+
+	$fresh = Felix_Settings::connection_status_from_state( true, $now - 30, false, $now );
+	expect_eq( 'fresh heartbeat is connected', $fresh['status'], 'connected' );
+
+	$staleish = Felix_Settings::connection_status_from_state( true, $now - 901, false, $now );
+	expect_eq( 'heartbeat 15min+ is connecting', $staleish['status'], 'connecting' );
+
+	$dead = Felix_Settings::connection_status_from_state( true, $now - 7200, true, $now );
+	expect_eq( 'heartbeat 2h+ with DISABLE_WP_CRON is wp_cron_disabled', $dead['status'], 'wp_cron_disabled' );
+
+	$dead_cron_on = Felix_Settings::connection_status_from_state( true, $now - 7200, false, $now );
+	expect_eq( 'heartbeat 2h+ with cron enabled is stale', $dead_cron_on['status'], 'stale' );
+}
+
+/**
+ * Skipped runs record status but must not stamp last_run_at (old Connected lie).
+ */
+function test_skipped_run_does_not_stamp_last_run_at() {
+	echo "\n[skipped run does not stamp last_run_at]\n";
+	$GLOBALS['__felix_options'] = array();
+
+	Felix_Runner::persist_run_outcome( 'skipped' );
+	expect( 'skipped does not set last_run_at', ! isset( $GLOBALS['__felix_options']['felix_last_run_at'] ) );
+	expect_eq( 'skipped still records status', $GLOBALS['__felix_options']['felix_last_run_status'], 'skipped' );
+
+	Felix_Runner::persist_run_outcome( 'success' );
+	$stamped = $GLOBALS['__felix_options']['felix_last_run_at'];
+	expect( 'success stamps last_run_at', is_int( $stamped ) && $stamped > 0 );
+	expect_eq( 'success sets liveness connected', $GLOBALS['__felix_options'][ FELIX_OPT_LIVENESS_STATE ], 'connected' );
+
+	$before_skip = $stamped;
+	// Freeze: skipped must leave the success timestamp alone.
+	Felix_Runner::persist_run_outcome( 'skipped' );
+	expect_eq( 'skipped leaves last_run_at from last real run', $GLOBALS['__felix_options']['felix_last_run_at'], $before_skip );
+	expect_eq( 'skipped overwrites status only', $GLOBALS['__felix_options']['felix_last_run_status'], 'skipped' );
+}
+
+/**
+ * Unpair must drop the runner lease so a re-pair within ~60s can check in.
+ */
+function test_unpair_clears_runner_lease() {
+	echo "\n[unpair clears runner lease]\n";
+	$keys = Felix_Settings::pairing_state_option_keys();
+	expect( 'unpair list includes runner lease', in_array( FELIX_OPT_RUNNER_LEASE, $keys, true ) );
+	expect( 'unpair list includes heartbeat', in_array( FELIX_OPT_RUNNER_HEARTBEAT, $keys, true ) );
+	expect( 'unpair list includes paired flag', in_array( FELIX_OPT_PAIRED, $keys, true ) );
+
+	$GLOBALS['__felix_options'] = array(
+		FELIX_OPT_PAIRED         => true,
+		FELIX_OPT_RUNNER_LEASE   => array( 'holder' => 'old-runner', 'expiresAt' => time() + 60 ),
+		FELIX_OPT_RUNNER_HEARTBEAT => time(),
+		'felix_last_run_at'      => time(),
+	);
+	foreach ( $keys as $key ) {
+		delete_option( $key );
+	}
+	expect( 'lease gone after unpair keys deleted', ! isset( $GLOBALS['__felix_options'][ FELIX_OPT_RUNNER_LEASE ] ) );
+	expect( 'paired flag gone', ! isset( $GLOBALS['__felix_options'][ FELIX_OPT_PAIRED ] ) );
+	expect( 'heartbeat gone', ! isset( $GLOBALS['__felix_options'][ FELIX_OPT_RUNNER_HEARTBEAT ] ) );
+}
+
+/**
+ * F-06 — WP-Cron runner cadence must be 60s (felix_minute), not five_minutes.
+ * Watchdog stays on five_minutes (diagnostics, not command delivery).
+ */
+function test_wp_cron_runner_interval_is_one_minute() {
+	echo "\n[F-06 WP-Cron runner interval]\n";
+	$src = file_get_contents( FELIX_CONNECTOR_PLUGIN_DIR . 'felix-connector.php' );
+	expect( 'felix_minute schedule is 60s', (bool) preg_match( "/\\\$schedules\\['felix_minute'\\][\\s\\S]*?'interval'\\s*=>\\s*60/", $src ) );
+	expect( 'activation schedules felix_minute for runner', false !== strpos( $src, "wp_schedule_event( time(), 'felix_minute', 'felix_connector_cron' )" ) );
+	$settings = file_get_contents( FELIX_CONNECTOR_PLUGIN_DIR . 'includes/class-felix-settings.php' );
+	expect( 'settings recommend 1-minute host cron (TTL 120s)', false !== strpos( $settings, 'every 1 minute' ) );
+	expect( 'settings mark 5-minute host cron unsafe', false !== strpos( $settings, '5-minute host cron is unsafe' ) );
+	expect( 'settings do not recommend 5-minute host cron for command delivery', false === strpos( $settings, 'hits wp-cron.php every 5 minutes' ) );
+	expect( 'ensure_cron migrates onto felix_minute', false !== strpos( $src, "'felix_minute' === \$event->schedule" ) );
+	expect( 'runner is NOT scheduled as five_minutes', false === strpos( $src, "wp_schedule_event( time(), 'five_minutes', 'felix_connector_cron' )" ) );
+	expect( 'watchdog stays five_minutes', false !== strpos( $src, "wp_schedule_event( time(), 'five_minutes', 'felix_connector_watchdog' )" ) );
 }
 
 // =============================================================================
@@ -1730,6 +2263,13 @@ test_fresh_conflict_then_later_terminal_retrieval();
 test_renew_handler_registered();
 test_authorization_basis_object_form();
 test_pairing_code_normalization();
+test_required_release_files_present();
+test_cron_fallback_and_connecting_copy();
+test_pair_error_copy();
+test_connection_status_uses_heartbeat_not_skipped_run();
+test_skipped_run_does_not_stamp_last_run_at();
+test_unpair_clears_runner_lease();
+test_wp_cron_runner_interval_is_one_minute();
 
 // v0.4.1 command-surface parity.
 test_command_surface_parity();
@@ -1745,6 +2285,11 @@ test_create_order();
 test_create_order_variation_override();
 test_delete_customer();
 test_new_family_authorization_classification();
+test_list_orders_and_search_orders_against_hpos_contract();
+test_coupon_money_precision();
+test_l05_pre_mutation_validation_error();
+test_list_customers_uses_real_wc_api();
+test_engine_error_becomes_terminal();
 
 echo str_repeat( '=', 60 ) . "\n";
 $total = $GLOBALS['__pass'] + $GLOBALS['__fail'];

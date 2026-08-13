@@ -25,6 +25,9 @@ $options = array(
 	'felix_runner_lease',
 	'felix_seen_nonces',
 	'felix_liveness_state',
+	'felix_last_poll_error',
+	'felix_last_run_at',
+	'felix_last_run_status',
 );
 
 foreach ( $options as $option ) {

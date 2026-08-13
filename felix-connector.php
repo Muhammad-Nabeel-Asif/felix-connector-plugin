@@ -3,7 +3,7 @@
  * Plugin Name:       Felix Connector
  * Plugin URI:        https://agentfelix.ai
  * Description:       Connects your WooCommerce store to Felix (agentfelix.ai). Felix executes commands locally via outbound-only communication — your store's host firewall is never bypassed.
- * Version:           0.4.1
+ * Version:           0.4.3
  * Requires at least: 6.0
  * Requires PHP:      8.1
  * Author:            Felix
@@ -23,7 +23,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 // These MUST load before the CLI short-circuit below: Felix_Runner now depends
 // on the shared processor/handlers/ledger/crypto/pairing classes and on the
 // option/protocol constants at runtime.
-define( 'FELIX_CONNECTOR_VERSION', '0.4.1' );
+define( 'FELIX_CONNECTOR_VERSION', '0.4.3' );
 define( 'FELIX_CONNECTOR_PLUGIN_FILE', __FILE__ );
 define( 'FELIX_CONNECTOR_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'FELIX_CONNECTOR_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
@@ -43,11 +43,11 @@ define( 'FELIX_OPT_RUNNER_HEARTBEAT', 'felix_runner_heartbeat' );
 define( 'FELIX_OPT_RUNNER_LEASE', 'felix_runner_lease' );
 define( 'FELIX_OPT_SEEN_NONCES', 'felix_seen_nonces' );
 define( 'FELIX_OPT_LIVENESS_STATE', 'felix_liveness_state' );
+define( 'FELIX_OPT_LAST_POLL_ERROR', 'felix_last_poll_error' );
 
-// Default API base (configurable via filter).
-if ( ! defined( 'FELIX_API_BASE' ) ) {
-	define( 'FELIX_API_BASE', 'https://api.agentfelix.ai' );
-}
+// Default API base is NOT hardcoded here. Missing FELIX_API_BASE fails closed
+// unless FELIX_ENVIRONMENT is explicitly `production` (see Felix_Settings::resolve_api_base).
+// Pairing must never silently POST a code to https://api.agentfelix.ai from local/staging.
 
 // Protocol version.
 //
@@ -89,10 +89,16 @@ if ( defined( 'FELIX_RUNNER_MODE' ) && FELIX_RUNNER_MODE ) {
 	exit;
 }
 
-// Add custom cron schedule.
+// Add custom cron schedules.
 add_filter(
 	'cron_schedules',
 	function ( $schedules ) {
+		// Command runner cadence (F-06): must stay strictly below command TTL
+		// (120s) so a poll-only store can claim before expiry.
+		$schedules['felix_minute'] = array(
+			'interval' => 60,
+			'display'  => __( 'Every Minute (Felix Connector)', 'felix-connector' ),
+		);
 		$schedules['five_minutes'] = array(
 			'interval' => 300,
 			'display'  => __( 'Every 5 Minutes', 'felix-connector' ),
@@ -124,9 +130,9 @@ function felix_connector_activate() {
 		update_option( FELIX_OPT_KILL_SWITCHES, array(), false );
 	}
 
-	// Schedule WP-Cron runner event.
+	// Schedule WP-Cron runner event (60s — poll cadence < command TTL).
 	if ( ! wp_next_scheduled( 'felix_connector_cron' ) ) {
-		wp_schedule_event( time(), 'five_minutes', 'felix_connector_cron' );
+		wp_schedule_event( time(), 'felix_minute', 'felix_connector_cron' );
 	}
 
 	// Schedule watchdog (keep existing).
@@ -167,20 +173,25 @@ function felix_connector_deactivate() {
 register_deactivation_hook( __FILE__, 'felix_connector_deactivate' );
 
 /**
- * Self-healing: ensure WP-Cron event is registered on every init.
- * Catches cases where the event was lost (manual unschedule, migration, etc.).
+ * Self-healing: ensure WP-Cron runner is registered on every init, and migrate
+ * existing `five_minutes` events onto `felix_minute` after plugin upgrade
+ * (F-06). Watchdog stays on five_minutes (diagnostics only).
  */
 function felix_connector_ensure_cron_scheduled() {
-	if ( ! wp_next_scheduled( 'felix_connector_cron' ) ) {
-		wp_schedule_event( time(), 'five_minutes', 'felix_connector_cron' );
+	$event     = function_exists( 'wp_get_scheduled_event' ) ? wp_get_scheduled_event( 'felix_connector_cron' ) : false;
+	$on_minute = is_object( $event ) && isset( $event->schedule ) && 'felix_minute' === $event->schedule;
+	if ( $on_minute ) {
+		return;
 	}
+	wp_clear_scheduled_hook( 'felix_connector_cron' );
+	wp_schedule_event( time(), 'felix_minute', 'felix_connector_cron' );
 }
 add_action( 'init', 'felix_connector_ensure_cron_scheduled' );
 
 /**
  * WP-Cron runner callback — short bounded poll cycle.
  *
- * Fires every 5 minutes via WP-Cron (triggered by site traffic).
+ * Fires every 60 seconds via WP-Cron (triggered by site traffic).
  * Shares the same flock + DB-lease mutex as the external CLI runner,
  * so both can coexist without double-executing commands.
  */
@@ -193,6 +204,27 @@ function felix_connector_cron_runner() {
 	$runner->run_wp_cron();
 }
 add_action( 'felix_connector_cron', 'felix_connector_cron_runner' );
+
+/**
+ * One-shot short check-in for the admin "Check in now" button and post-pair.
+ *
+ * Same verify → reserve → execute pipeline as WP-Cron, but a single short
+ * poll so the settings page does not hang for a full 50s cycle.
+ *
+ * @return string success|error|skipped
+ */
+function felix_connector_checkin_now() {
+	if ( ! get_option( FELIX_OPT_PAIRED ) ) {
+		return 'skipped';
+	}
+
+	if ( function_exists( 'set_time_limit' ) ) {
+		set_time_limit( 30 );
+	}
+
+	$runner = new Felix_Runner();
+	return $runner->run_checkin();
+}
 
 /**
  * wp-cron watchdog — best-effort diagnostics only.
@@ -245,8 +277,12 @@ function felix_connector_watchdog() {
 				}
 			}
 
+			$api_base = Felix_Settings::resolve_api_base();
+			if ( '' === $api_base ) {
+				return;
+			}
 			wp_remote_post(
-				FELIX_API_BASE . '/connector/heartbeat',
+				$api_base . '/connector/heartbeat',
 				array(
 					'headers' => $headers,
 					'body'    => $body_json,

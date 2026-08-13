@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test-and-zip:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.1'
+          extensions: sodium, zip
+          coverage: none
+
+      - name: Run behavioral tests
+        run: php tests/run.php
+
+      - name: Build release ZIP
+        run: bash scripts/build-zip.sh
+
+      - name: Fail if UI-referenced files are missing from the ZIP
+        run: php scripts/assert-zip-contents.php dist/felix-connector.zip
+
+      - name: Upload plugin ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: felix-connector
+          path: dist/felix-connector.zip
