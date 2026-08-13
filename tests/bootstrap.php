@@ -20,7 +20,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 // --- Plugin constants (mirror felix-connector.php) ---------------------------
-define( 'FELIX_CONNECTOR_VERSION', '0.4.1' );
+define( 'FELIX_CONNECTOR_VERSION', '0.4.3' );
 define( 'FELIX_CONNECTOR_PLUGIN_FILE', __FILE__ );
 define( 'FELIX_CONNECTOR_PLUGIN_DIR', __DIR__ . '/../' );
 define( 'FELIX_CONNECTOR_PLUGIN_URL', '' );
@@ -39,6 +39,7 @@ define( 'FELIX_OPT_RUNNER_HEARTBEAT', 'felix_runner_heartbeat' );
 define( 'FELIX_OPT_RUNNER_LEASE', 'felix_runner_lease' );
 define( 'FELIX_OPT_SEEN_NONCES', 'felix_seen_nonces' );
 define( 'FELIX_OPT_LIVENESS_STATE', 'felix_liveness_state' );
+define( 'FELIX_OPT_LAST_POLL_ERROR', 'felix_last_poll_error' );
 
 if ( ! defined( 'FELIX_API_BASE' ) ) {
 	define( 'FELIX_API_BASE', 'https://api.test.local' );
@@ -460,6 +461,130 @@ function wc_get_order( $the_order = false ) {
 	return new WC_Order( $id );
 }
 
+/**
+ * HPOS-faithful wc_get_orders stub.
+ *
+ * Real WooCommerce (HPOS OrdersTableQuery on trunk) honors `s` for search and
+ * `billing_email` / `customer` for email lookup. It does NOT honor a `search`
+ * query var — that key is ignored. This stub matches that contract so a handler
+ * that passes `search` cannot hide behind a shim that pretends WooCommerce
+ * accepted it (the 2026-08-09 production empty-result class).
+ */
+function wc_get_orders( $args = array() ) {
+	$GLOBALS['__felix_last_wc_get_orders_args'] = $args;
+	$all = array();
+	foreach ( array_keys( $GLOBALS['__felix_orders_meta'] ) as $id ) {
+		$all[] = new WC_Order( $id );
+	}
+
+	if ( ! empty( $args['billing_email'] ) ) {
+		$want = strtolower( (string) $args['billing_email'] );
+		$all  = array_values(
+			array_filter(
+				$all,
+				function ( $order ) use ( $want ) {
+					return strtolower( $order->get_billing_email() ) === $want;
+				}
+			)
+		);
+	} elseif ( isset( $args['customer'] ) && $args['customer'] !== '' && ! is_numeric( $args['customer'] ) ) {
+		$want = strtolower( (string) $args['customer'] );
+		$all  = array_values(
+			array_filter(
+				$all,
+				function ( $order ) use ( $want ) {
+					return strtolower( $order->get_billing_email() ) === $want;
+				}
+			)
+		);
+	}
+
+	if ( ! empty( $args['status'] ) ) {
+		$statuses = is_array( $args['status'] ) ? $args['status'] : array( $args['status'] );
+		$statuses = array_map(
+			function ( $s ) {
+				return preg_replace( '/^wc-/', '', (string) $s );
+			},
+			$statuses
+		);
+		$all = array_values(
+			array_filter(
+				$all,
+				function ( $order ) use ( $statuses ) {
+					return in_array( $order->get_status(), $statuses, true );
+				}
+			)
+		);
+	}
+
+	if ( ! empty( $args['date_created'] ) ) {
+		$spec = (string) $args['date_created'];
+		$all  = array_values(
+			array_filter(
+				$all,
+				function ( $order ) use ( $spec ) {
+					$created = $order->get_date_created();
+					$ts      = $created && method_exists( $created, 'date' ) ? strtotime( $created->date( 'c' ) ) : 0;
+					return felix_order_date_matches( $ts, $spec );
+				}
+			)
+		);
+	}
+
+	$order = strtoupper( (string) ( $args['order'] ?? 'DESC' ) );
+	usort(
+		$all,
+		function ( $a, $b ) use ( $order ) {
+			$ta = $a->get_date_created() ? strtotime( $a->get_date_created()->date( 'c' ) ) : 0;
+			$tb = $b->get_date_created() ? strtotime( $b->get_date_created()->date( 'c' ) ) : 0;
+			return 'ASC' === $order ? ( $ta <=> $tb ) : ( $tb <=> $ta );
+		}
+	);
+
+	$limit = isset( $args['limit'] ) ? (int) $args['limit'] : 20;
+	$page  = isset( $args['page'] ) ? max( (int) $args['page'], 1 ) : 1;
+	if ( $limit < 0 ) {
+		return $all;
+	}
+	return array_slice( $all, ( $page - 1 ) * $limit, $limit );
+}
+
+function felix_order_date_matches( $ts, $spec ) {
+	if ( strpos( $spec, '...' ) !== false ) {
+		$parts = explode( '...', $spec, 2 );
+		$lo    = felix_parse_wc_date_bound( $parts[0] );
+		$hi    = felix_parse_wc_date_bound( $parts[1] );
+		return $ts >= $lo && $ts <= $hi;
+	}
+	if ( preg_match( '/^(>=|>|<=|<)(.+)$/', $spec, $m ) ) {
+		$bound = felix_parse_wc_date_bound( $m[2] );
+		switch ( $m[1] ) {
+			case '>':
+				return $ts > $bound;
+			case '>=':
+				return $ts >= $bound;
+			case '<':
+				return $ts < $bound;
+			case '<=':
+				return $ts <= $bound;
+		}
+	}
+	$bound = felix_parse_wc_date_bound( $spec );
+	return $ts === $bound;
+}
+
+function felix_parse_wc_date_bound( $raw ) {
+	$raw = trim( (string) $raw );
+	if ( $raw === '' ) {
+		return 0;
+	}
+	if ( preg_match( '/^\d+$/', $raw ) ) {
+		return (int) $raw;
+	}
+	$parsed = strtotime( $raw );
+	return $parsed === false ? 0 : $parsed;
+}
+
 function wc_create_order( $args = array() ) {
 	$id                                       = ++$GLOBALS['__felix_next_id']['order'];
 	$GLOBALS['__felix_orders_meta'][ $id ]    = array(
@@ -479,6 +604,7 @@ function wc_create_order( $args = array() ) {
 }
 
 function wc_create_refund( $args = array() ) {
+	$GLOBALS['__felix_last_refund_args'] = $args;
 	$order_id = (int) ( $args['order_id'] ?? 0 );
 	$amount   = isset( $args['amount'] ) ? (float) $args['amount'] : 0.0;
 	if ( ! isset( $GLOBALS['__felix_orders_meta'][ $order_id ] ) ) {
@@ -490,10 +616,11 @@ function wc_create_refund( $args = array() ) {
 	$GLOBALS['__felix_orders_meta'][ $order_id ]['total_refunded'] += $amount;
 	$id                                 = ++$GLOBALS['__felix_next_id']['refund'];
 	$GLOBALS['__felix_refunds'][ $id ]  = array(
-		'id'      => $id,
-		'amount'  => $amount,
-		'reason'  => (string) ( $args['reason'] ?? '' ),
-		'created' => time(),
+		'id'       => $id,
+		'order_id' => $order_id,
+		'amount'   => $amount,
+		'reason'   => (string) ( $args['reason'] ?? '' ),
+		'created'  => time(),
 	);
 	return new WC_Order_Refund( $id );
 }
@@ -753,6 +880,15 @@ if ( ! class_exists( 'WC_Order' ) ) {
 		}
 		public function get_items( $type = '' ) {
 			return $this->items;
+		}
+		public function get_refunds() {
+			$out = array();
+			foreach ( $GLOBALS['__felix_refunds'] as $id => $data ) {
+				if ( (int) ( $data['order_id'] ?? 0 ) === $this->id ) {
+					$out[] = new WC_Order_Refund( $id );
+				}
+			}
+			return $out;
 		}
 
 		public function set_customer_id( $v ) {
@@ -1123,6 +1259,93 @@ if ( ! class_exists( 'WP_Query' ) ) {
 	}
 }
 
+if ( ! class_exists( 'WC_Customer' ) ) {
+	class WC_Customer {
+		private $id;
+		private $user;
+		public function __construct( $id = 0 ) {
+			$this->id   = (int) $id;
+			$this->user = $GLOBALS['__felix_users'][ $this->id ] ?? null;
+		}
+		public function get_id() {
+			return $this->id;
+		}
+		public function get_email() {
+			return $this->user ? ( $this->user->user_email ?? '' ) : '';
+		}
+		public function get_first_name() {
+			return $this->user ? ( $this->user->first_name ?? '' ) : '';
+		}
+		public function get_last_name() {
+			return $this->user ? ( $this->user->last_name ?? '' ) : '';
+		}
+		public function get_username() {
+			return $this->user ? ( $this->user->user_login ?? '' ) : '';
+		}
+		public function get_order_count() {
+			return 0;
+		}
+		public function get_total_spent() {
+			return '0';
+		}
+	}
+}
+
+if ( ! class_exists( 'WC_Customer_Query' ) ) {
+	class WC_Customer_Query {
+		private $args;
+		public function __construct( $args = array() ) {
+			$this->args = is_array( $args ) ? $args : array();
+		}
+		public function get_customers() {
+			$limit = isset( $this->args['limit'] ) ? max( (int) $this->args['limit'], 1 ) : 50;
+			$page  = isset( $this->args['page'] ) ? max( (int) $this->args['page'], 1 ) : 1;
+			$email = isset( $this->args['email'] ) ? strtolower( trim( (string) $this->args['email'] ) ) : '';
+			$out   = array();
+			foreach ( $GLOBALS['__felix_users'] as $u ) {
+				$roles = isset( $u->roles ) ? (array) $u->roles : array();
+				if ( ! in_array( 'customer', $roles, true ) ) {
+					continue;
+				}
+				if ( '' !== $email && 0 !== strcasecmp( $u->user_email, $email ) ) {
+					continue;
+				}
+				$out[] = new WC_Customer( (int) $u->ID );
+			}
+			$offset = ( $page - 1 ) * $limit;
+			return array_slice( $out, $offset, $limit );
+		}
+	}
+}
+
+function get_users( $args = array() ) {
+	$query = new WC_Customer_Query(
+		array(
+			'limit' => $args['number'] ?? 50,
+			'page'  => $args['paged'] ?? 1,
+			'email' => '',
+		)
+	);
+	if ( ! empty( $args['search'] ) ) {
+		$query = new WC_Customer_Query(
+			array(
+				'limit' => $args['number'] ?? 50,
+				'page'  => $args['paged'] ?? 1,
+				'email' => $args['search'],
+			)
+		);
+	}
+	$customers = $query->get_customers();
+	$users     = array();
+	foreach ( $customers as $c ) {
+		$u = get_user_by( 'id', $c->get_id() );
+		if ( $u ) {
+			$users[] = $u;
+		}
+	}
+	return $users;
+}
+
 // --- Load the plugin classes under test --------------------------------------
 require_once FELIX_CONNECTOR_PLUGIN_DIR . 'includes/class-felix-crypto.php';
 require_once FELIX_CONNECTOR_PLUGIN_DIR . 'includes/class-felix-pairing.php';
@@ -1131,3 +1354,4 @@ require_once FELIX_CONNECTOR_PLUGIN_DIR . 'includes/class-felix-command-ledger.p
 require_once FELIX_CONNECTOR_PLUGIN_DIR . 'includes/class-felix-command-handlers.php';
 require_once FELIX_CONNECTOR_PLUGIN_DIR . 'includes/class-felix-command-processor.php';
 require_once FELIX_CONNECTOR_PLUGIN_DIR . 'includes/class-felix-rest.php';
+require_once FELIX_CONNECTOR_PLUGIN_DIR . 'includes/class-felix-runner.php';
